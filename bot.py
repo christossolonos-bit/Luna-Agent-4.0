@@ -1175,14 +1175,14 @@ def _build_x_invite_message(song_title: str, song_url: str) -> str:
     if len(clean_title) > 80:
         clean_title = clean_title[:77].rstrip() + "..."
     templates = [
-        "Hey friends, check out this track from my channel: \"{title}\" 🎶\n\nWould love to hear what you think!\n{url}\n\n{handle}",
-        "Random song pick from my channel today: \"{title}\" ✨\n\nGive it a listen and tell me your vibe:\n{url}\n\n{handle}",
-        "Sharing one of my songs: \"{title}\" 🎧\n\nIf you enjoy it, drop a comment and share it around!\n{url}\n\n{handle}",
+        "Hey guys, it's a great time to listen to this one: \"{title}\" 🎶\n\nGive it a play and tell me what you think!\n{url}",
+        "Hey everyone, if you need a fresh vibe right now, try this track: \"{title}\" ✨\n\nPress play and drop your feedback!\n{url}",
+        "Quick music drop for today: \"{title}\" 🎧\n\nListen now, and if you like it, share it with a friend!\n{url}",
     ]
-    msg = random.choice(templates).format(title=clean_title, url=song_url, handle=X_HANDLE)
+    msg = random.choice(templates).format(title=clean_title, url=song_url)
     # Keep some margin under X limit so URL normalization and emojis won't disable Post.
     if len(msg) > 260:
-        msg = f"{clean_title}\n{song_url}\n{X_HANDLE}"
+        msg = f"Hey guys, it's a great time to listen to this song.\n{clean_title}\n{song_url}"
     return msg
 
 
@@ -1478,12 +1478,80 @@ def _run_x_share_random_song() -> tuple[bool, str]:
                         pass
                     return False
 
+                def _resolve_x_profile_popup() -> None:
+                    """
+                    If X mention/typeahead popup is open, select the profile suggestion
+                    (or dismiss popup) so the Post button can be clicked.
+                    """
+                    try:
+                        popup_visible = False
+                        for popup_sel in (
+                            "div[role='dialog'] div[role='listbox']",
+                            "div[role='dialog'] [id^='typeaheadDropdown']",
+                            "div[data-testid='typeaheadResults']",
+                        ):
+                            p = page.locator(popup_sel).first
+                            try:
+                                if p.count() and p.is_visible():
+                                    popup_visible = True
+                                    break
+                            except Exception:
+                                continue
+                        if not popup_visible:
+                            return
+
+                        handle_txt = (X_HANDLE or "").lstrip("@").strip()
+                        selectors = []
+                        if handle_txt:
+                            selectors.extend(
+                                [
+                                    f"div[role='dialog'] [role='option']:has-text('{handle_txt}')",
+                                    f"div[role='dialog'] div[data-testid='typeaheadResult']:has-text('{handle_txt}')",
+                                ]
+                            )
+                        selectors.extend(
+                            [
+                                "div[role='dialog'] [role='option']",
+                                "div[role='dialog'] div[data-testid='typeaheadResult']",
+                            ]
+                        )
+
+                        for sel in selectors:
+                            opt = page.locator(sel).first
+                            try:
+                                if opt.count() and opt.is_visible():
+                                    opt.click(timeout=2500, force=True)
+                                    page.wait_for_timeout(220)
+                                    return
+                            except Exception:
+                                continue
+
+                        # Keyboard fallback: accept first suggestion.
+                        try:
+                            page.keyboard.press("ArrowDown")
+                            page.wait_for_timeout(100)
+                            page.keyboard.press("Enter")
+                            page.wait_for_timeout(220)
+                            return
+                        except Exception:
+                            pass
+
+                        # Last fallback: close popup so it doesn't block Post.
+                        try:
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(180)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
                 if not _focus_x_textbox(textbox):
                     return False, "I found the X post box but couldn't focus it (an overlay is intercepting clicks)."
 
                 # Keep browser visibly open while typing so user can watch the full post text.
                 if not _set_x_text(textbox, message, delay_ms=26):
                     return False, "I couldn't type into the X post box. The compose overlay appears to be blocking input."
+                _resolve_x_profile_popup()
 
                 post_btn = page.locator("div[role='dialog'] button[data-testid='tweetButtonInline']").first
                 if not (post_btn.count() and post_btn.is_visible()):
@@ -1513,9 +1581,10 @@ def _run_x_share_random_song() -> tuple[bool, str]:
 
                 if not _is_enabled(post_btn):
                     # Fallback: retype a shorter plain message in case rich text input failed to register.
-                    short_message = f"{song_title[:60].strip()} {song_url} {X_HANDLE}".strip()[:220]
+                    short_message = f"{song_title[:60].strip()} {song_url}".strip()[:220]
                     if not _set_x_text(textbox, short_message, delay_ms=14):
                         return False, "I couldn't re-focus and retype into the X post box for retry."
+                    _resolve_x_profile_popup()
                     deadline2 = time.time() + 6
                     while time.time() < deadline2 and not _is_enabled(post_btn):
                         page.wait_for_timeout(250)
