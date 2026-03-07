@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 venv/
 .env.local
+data/
+Luna projects/music_local/
+*.wav
+*.mp3
