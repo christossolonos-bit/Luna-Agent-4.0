@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Luna</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      color: #e0e8ff;
+      overflow: hidden;
+      background: #060810;
+      background: linear-gradient(135deg, #060810 0%, #0a1628 20%, #0d2847 40%, #1a3a5c 60%, #0f3460 80%, #060810 100%);
+      background-size: 400% 400%;
+      animation: bgShift 18s ease-in-out infinite;
+    }
+    @keyframes bgShift {
+      0%, 100% { background-position: 0% 50%; }
+      33% { background-position: 100% 25%; }
+      66% { background-position: 50% 100%; }
+    }
+
+    .jarvis-ring {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: min(90vmin, 480px);
+      height: min(90vmin, 480px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    .ring {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 2px solid transparent;
+      background: conic-gradient(from 0deg, transparent 0deg, rgba(0, 255, 255, 0.12) 60deg, rgba(100, 200, 255, 0.35) 120deg, rgba(255, 255, 255, 0.15) 180deg, rgba(0, 200, 255, 0.12) 240deg, transparent 300deg);
+      animation: spin 12s linear infinite;
+    }
+    .ring:nth-child(2) {
+      inset: 10%;
+      background: conic-gradient(from 180deg, transparent 0deg, rgba(0, 255, 200, 0.1) 80deg, rgba(0, 255, 255, 0.3) 160deg, transparent 240deg);
+      animation-duration: 8s;
+      animation-direction: reverse;
+    }
+    .ring:nth-child(3) {
+      inset: 22%;
+      background: conic-gradient(from 90deg, transparent 0deg, rgba(150, 220, 255, 0.18) 100deg, rgba(255, 255, 255, 0.12) 200deg, transparent 280deg);
+      animation-duration: 14s;
+    }
+    .ring:nth-child(4) {
+      inset: 35%;
+      background: conic-gradient(from 270deg, transparent 0deg, rgba(0, 255, 255, 0.08) 90deg, rgba(80, 180, 255, 0.2) 180deg, transparent 270deg);
+      animation-duration: 20s;
+      animation-direction: reverse;
+    }
+    .ring-inner {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 24%;
+      height: 24%;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(0, 255, 255, 0.2) 0%, transparent 70%);
+      box-shadow: 0 0 50px rgba(0, 255, 255, 0.15);
+      animation: pulse 4s ease-in-out infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes pulse {
+      50% { opacity: 0.75; transform: translate(-50%, -50%) scale(1.08); }
+    }
+
+    .ui {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 1rem;
+    }
+    .title {
+      font-size: 1.75rem;
+      font-weight: 300;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: rgba(0, 255, 255, 0.95);
+      text-align: center;
+      margin: 0.5rem 0 0 0;
+      text-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+    }
+    .chat-log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1rem 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .msg {
+      max-width: 85%;
+      padding: 0.65rem 1rem;
+      border-radius: 12px;
+      line-height: 1.4;
+      word-wrap: break-word;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: rgba(0, 100, 200, 0.35);
+      border: 1px solid rgba(0, 200, 255, 0.4);
+      color: #e0e8ff;
+    }
+    .msg.luna {
+      align-self: flex-start;
+      background: rgba(10, 25, 45, 0.85);
+      border: 1px solid rgba(0, 255, 255, 0.25);
+      color: #e0e8ff;
+    }
+    .msg .label {
+      font-size: 0.7rem;
+      opacity: 0.8;
+      margin-bottom: 0.25rem;
+    }
+    .msg.luna .msg-body { }
+    .input-row {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.75rem 0;
+      border-top: 1px solid rgba(0, 255, 255, 0.2);
+    }
+    .input-row textarea {
+      flex: 1;
+      min-height: 48px;
+      max-height: 120px;
+      padding: 0.75rem 1rem;
+      background: rgba(10, 20, 35, 0.9);
+      border: 1px solid rgba(0, 255, 255, 0.3);
+      border-radius: 10px;
+      color: #e0e8ff;
+      font-size: 1rem;
+      resize: none;
+      outline: none;
+      font-family: inherit;
+    }
+    .input-row textarea::placeholder {
+      color: rgba(224, 232, 255, 0.45);
+    }
+    .input-row textarea:focus {
+      border-color: rgba(0, 255, 255, 0.6);
+      box-shadow: 0 0 12px rgba(0, 255, 255, 0.15);
+    }
+    .btn-send {
+      padding: 0.75rem 1.25rem;
+      background: linear-gradient(180deg, rgba(0, 180, 220, 0.5) 0%, rgba(0, 120, 180, 0.5) 100%);
+      border: 1px solid rgba(0, 255, 255, 0.4);
+      border-radius: 10px;
+      color: #e0e8ff;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background 0.2s, box-shadow 0.2s;
+    }
+    .btn-send:hover {
+      background: linear-gradient(180deg, rgba(0, 200, 240, 0.5) 0%, rgba(0, 140, 200, 0.5) 100%);
+      box-shadow: 0 0 16px rgba(0, 255, 255, 0.25);
+    }
+    .btn-send:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .status {
+      font-size: 0.8rem;
+      color: rgba(224, 232, 255, 0.5);
+      min-height: 1.2em;
+    }
+  </style>
+</head>
+<body>
+  <div class="jarvis-ring" aria-hidden="true">
+    <div class="ring"></div>
+    <div class="ring"></div>
+    <div class="ring"></div>
+    <div class="ring"></div>
+    <div class="ring-inner"></div>
+  </div>
+
+  <div class="ui">
+    <h1 class="title">Luna</h1>
+    <div class="chat-log" id="chatLog"></div>
+    <div class="input-row">
+      <textarea id="input" placeholder="Chat with Luna…" rows="1"></textarea>
+      <button type="button" class="btn-send" id="send">Send</button>
+    </div>
+    <p class="status" id="status"></p>
+  </div>
+
+  <script>
+    const chatLog = document.getElementById('chatLog');
+    const input = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+    const statusEl = document.getElementById('status');
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    function addMessage(who, text) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + who;
+      const label = who === 'user' ? 'You' : 'Luna';
+      if (who === 'luna') {
+        div.innerHTML =
+          '<span class="label">' + escapeHtml(label) + '</span>' +
+          '<div class="msg-body">' + escapeHtml(text).replace(/\n/g, '<br>') + '</div>';
+      } else {
+        div.innerHTML = '<span class="label">' + escapeHtml(label) + '</span><div>' + escapeHtml(text).replace(/\n/g, '<br>') + '</div>';
+      }
+      chatLog.appendChild(div);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    async function playReplyTTS(text) {
+      if (!text) return;
+      setStatus('Luna is speaking…');
+      try {
+        const res = await fetch('/api/tts-stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text })
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          setStatus(err.error || 'Voice failed. Try again.');
+          setTimeout(() => setStatus(''), 4000);
+          return;
+        }
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        const queue = [];
+        let playing = false;
+        const mime = 'audio/mpeg';
+
+        function playNext() {
+          if (queue.length === 0) {
+            playing = false;
+            setStatus('');
+            return;
+          }
+          const blob = queue.shift();
+          const url = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+          audio.volume = 1.0;
+          audio.onended = () => { URL.revokeObjectURL(url); playNext(); };
+          audio.onerror = () => playNext();
+          playing = true;
+          audio.play();
+        }
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          let event = '', data = '';
+          for (const line of lines) {
+            if (line.startsWith('event: ')) event = line.slice(7).trim();
+            else if (line.startsWith('data: ')) data = line.slice(6);
+            else if (line === '' && event && data) {
+              if (event === 'audio' && data) {
+                try {
+                  const binary = atob(data);
+                  const bytes = new Uint8Array(binary.length);
+                  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                  queue.push(new Blob([bytes], { type: mime }));
+                  if (!playing) playNext();
+                } catch (_) {}
+              }
+              event = '';
+              data = '';
+            }
+          }
+        }
+        if (!playing && queue.length > 0) playNext();
+        else if (queue.length === 0) setStatus('');
+      } catch (_) {
+        setStatus('');
+      }
+    }
+
+    let conversationHistory = [];
+
+    async function sendMessage() {
+      const text = (input.value || '').trim();
+      if (!text) return;
+      input.value = '';
+      addMessage('user', text);
+      sendBtn.disabled = true;
+      setStatus('Luna is thinking…');
+      const historyForRequest = conversationHistory.slice(-20);
+      conversationHistory.push({ role: 'user', content: text });
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, history: historyForRequest })
+        });
+        const data = await res.json();
+        const reply = data.reply || data.error || 'No response.';
+        addMessage('luna', reply);
+        conversationHistory.push({ role: 'assistant', content: reply });
+        if (conversationHistory.length > 50) conversationHistory = conversationHistory.slice(-40);
+        sendBtn.disabled = false;
+        // TTS plays on the PC/server side; browser-side playback disabled.
+      } catch (err) {
+        addMessage('luna', 'Error: ' + (err.message || 'Could not reach Luna.'));
+        conversationHistory.pop();
+        setStatus('');
+        sendBtn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
