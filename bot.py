@@ -8,6 +8,7 @@ Also runs a web UI at http://127.0.0.1:5050 — Jarvis-style chat in the browser
 """
 import asyncio
 import base64
+import html
 import io
 import json
 import os
@@ -189,6 +190,19 @@ X_PROFILE_DIR = os.environ.get(
     "X_PROFILE_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "x_profile"),
 ).strip()
+YOUTUBE_PROFILE_DIR = os.environ.get(
+    "YOUTUBE_PROFILE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "youtube_profile"),
+).strip()
+YOUTUBE_BROWSER_CHANNEL = (os.environ.get("YOUTUBE_BROWSER_CHANNEL") or "chrome").strip().lower()
+YOUTUBE_BROWSER_PATH = (os.environ.get("YOUTUBE_BROWSER_PATH") or "").strip()
+INSTAGRAM_PROFILE_DIR = os.environ.get(
+    "INSTAGRAM_PROFILE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "instagram_profile"),
+).strip()
+INSTAGRAM_BROWSER_CHANNEL = (os.environ.get("INSTAGRAM_BROWSER_CHANNEL") or "chrome").strip().lower()
+INSTAGRAM_BROWSER_PATH = (os.environ.get("INSTAGRAM_BROWSER_PATH") or "").strip()
+INSTAGRAM_BASE_URL = (os.environ.get("INSTAGRAM_BASE_URL") or "https://www.instagram.com").strip().rstrip("/")
 FACEBOOK_PROFILE_URL = (os.environ.get("FACEBOOK_PROFILE_URL") or "https://www.facebook.com/solonaras").strip()
 FACEBOOK_HOME_URL = (os.environ.get("FACEBOOK_HOME_URL") or "https://www.facebook.com/").strip()
 FACEBOOK_PROFILE_DIR = os.environ.get(
@@ -204,6 +218,12 @@ _x_bootstrap_running = False
 _fb_share_lock = threading.Lock()
 _fb_bootstrap_lock = threading.Lock()
 _fb_bootstrap_running = False
+_yt_comment_lock = threading.Lock()
+_yt_bootstrap_lock = threading.Lock()
+_yt_bootstrap_running = False
+_ig_dm_lock = threading.Lock()
+_ig_bootstrap_lock = threading.Lock()
+_ig_bootstrap_running = False
 
 
 def _collect_legacy_scopes_for_linked_user() -> list[str]:
@@ -646,6 +666,24 @@ def _can_use_x_share_discord(author_id: int) -> bool:
     return False
 
 
+def _can_use_youtube_comment_discord(author_id: int) -> bool:
+    """Allow YouTube comment automation on Discord only for linked user or configured admin."""
+    if _discord_admin_id_int is not None and author_id == _discord_admin_id_int:
+        return True
+    if _linked_discord_id_int is not None and author_id == _linked_discord_id_int:
+        return True
+    return False
+
+
+def _can_use_instagram_dm_discord(author_id: int) -> bool:
+    """Allow Instagram DM automation on Discord only for linked user or configured admin."""
+    if _discord_admin_id_int is not None and author_id == _discord_admin_id_int:
+        return True
+    if _linked_discord_id_int is not None and author_id == _linked_discord_id_int:
+        return True
+    return False
+
+
 def _extract_discord_user_id(target: str) -> int | None:
     """Parse a Discord user id from mention (<@123> / <@!123>) or raw id text."""
     t = (target or "").strip()
@@ -746,6 +784,75 @@ def _extract_local_song_description(text: str) -> str:
     return ""
 
 
+def _extract_youtube_video_url(text: str) -> str:
+    """Extract the first YouTube video URL from text/command."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    if low.startswith("!yt_comment "):
+        raw = raw[len("!yt_comment ") :].strip()
+    elif low.startswith("!youtube_comment "):
+        raw = raw[len("!youtube_comment ") :].strip()
+    elif low.startswith("!comment_youtube "):
+        raw = raw[len("!comment_youtube ") :].strip()
+    # Keep URL extraction permissive for conversational requests.
+    m = re.search(r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^\s)]+)", raw, re.IGNORECASE)
+    if not m:
+        return ""
+    return (m.group(1) or "").strip().rstrip(".,!?")
+
+
+def _extract_youtube_comment_request(text: str) -> str:
+    """Return YouTube URL if message asks Luna to comment on that video."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    url = _extract_youtube_video_url(raw)
+    if not url:
+        return ""
+    if low.startswith(("!yt_comment", "!youtube_comment", "!comment_youtube")):
+        return url
+    if re.search(r"\b(comment|reply)\b", low, re.IGNORECASE) and re.search(
+        r"\b(youtube|yt|video)\b", low, re.IGNORECASE
+    ):
+        return url
+    return ""
+
+
+def _extract_instagram_dm_request(text: str) -> tuple[str, str]:
+    """
+    Extract Instagram DM target + optional message.
+    Returns (username, message). username is empty if no request found.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return "", ""
+    low = raw.lower()
+    if low.startswith(("!ig_dm ", "!instagram_dm ", "!igdm ")):
+        parts = raw.split(None, 2)
+        if len(parts) < 2:
+            return "", ""
+        username = re.sub(r"^@", "", (parts[1] or "").strip())
+        msg = (parts[2] or "").strip() if len(parts) > 2 else ""
+        return username, msg
+
+    patterns = [
+        r"\b(?:message|dm|send(?:\s+a)?\s+message(?:\s+to)?)\s+@?([a-z0-9._]{2,30})\b.*\binstagram\b",
+        r"\binstagram\b.*\b(?:message|dm|send(?:\s+a)?\s+message(?:\s+to)?)\s+@?([a-z0-9._]{2,30})\b",
+    ]
+    for p in patterns:
+        m = re.search(p, low, re.IGNORECASE)
+        if m:
+            username = (m.group(1) or "").strip()
+            # Optional quoted message in conversational prompt.
+            m_msg = re.search(r'"([^"]{3,280})"', raw)
+            msg = (m_msg.group(1) or "").strip() if m_msg else ""
+            return username, msg
+    return "", ""
+
+
 def _intent_requires_tool_call(text: str) -> bool:
     """
     Binary intent gate for direct tool automation.
@@ -763,6 +870,8 @@ def _intent_requires_tool_call(text: str) -> bool:
         r"\bshare\s+my\s+song\b",
         r"\bshare\b.*\b(?:x|twitter|facebook)\b",
         r"\bpost\b.*\b(?:x|twitter|facebook)\b",
+        r"\bcomment\b.*\b(?:youtube|yt)\b",
+        r"\b(?:instagram|insta|ig)\b.*\b(?:message|dm|send)\b",
         r"\b(?:create|make)\b.*\b(?:song)\b",
         r"\b(?:open|use)\b.*\bsuno\b",
         r"\b(?:local\s+song|local\s+music)\b",
@@ -1986,6 +2095,832 @@ def _run_facebook_share_random_song() -> tuple[bool, str]:
             pass
 
 
+def _youtube_bootstrap_marker_path() -> str:
+    return os.path.join(YOUTUBE_PROFILE_DIR, ".login_ready")
+
+
+def _is_youtube_bootstrap_done() -> bool:
+    return os.path.isfile(_youtube_bootstrap_marker_path())
+
+
+def _mark_youtube_bootstrap_done() -> None:
+    try:
+        os.makedirs(YOUTUBE_PROFILE_DIR, exist_ok=True)
+        with open(_youtube_bootstrap_marker_path(), "w", encoding="utf-8") as f:
+            f.write("ready")
+    except Exception:
+        pass
+
+
+def _clear_youtube_bootstrap_done() -> None:
+    try:
+        marker = _youtube_bootstrap_marker_path()
+        if os.path.isfile(marker):
+            os.unlink(marker)
+    except Exception:
+        pass
+
+
+def _extract_youtube_video_id(video_url: str) -> str:
+    """Extract YouTube video id from standard/youtu.be/shorts URLs."""
+    u = (video_url or "").strip()
+    if not u:
+        return ""
+    try:
+        p = urllib.parse.urlparse(u)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").strip("/")
+        if "youtu.be" in host:
+            return path.split("/")[0].strip()
+        if "youtube.com" in host:
+            if path == "watch":
+                return (urllib.parse.parse_qs(p.query).get("v") or [""])[0].strip()
+            if path.startswith("shorts/") or path.startswith("live/"):
+                return path.split("/", 1)[1].split("/")[0].strip()
+            if path.startswith("embed/"):
+                return path.split("/", 1)[1].split("/")[0].strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _is_youtube_shorts_url(video_url: str) -> bool:
+    """True when URL points to youtube.com/shorts/..."""
+    u = (video_url or "").strip()
+    if not u:
+        return False
+    try:
+        p = urllib.parse.urlparse(u)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+        return ("youtube.com" in host) and path.startswith("/shorts/")
+    except Exception:
+        return False
+
+
+def _fetch_youtube_watch_html(video_id: str) -> str:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        },
+    )
+    with urllib.request.urlopen(req, timeout=35) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _extract_caption_base_url_from_watch_html(html_text: str) -> str:
+    if not html_text:
+        return ""
+    # Locate first caption track object and parse baseUrl.
+    m = re.search(r'"captionTracks"\s*:\s*(\[[^\]]+\])', html_text, re.DOTALL)
+    if not m:
+        return ""
+    raw = m.group(1)
+    try:
+        tracks = json.loads(raw)
+    except Exception:
+        return ""
+    if not isinstance(tracks, list) or not tracks:
+        return ""
+    preferred = None
+    for t in tracks:
+        try:
+            code = (((t.get("languageCode") or "") if isinstance(t, dict) else "") or "").lower()
+            if code.startswith("en"):
+                preferred = t
+                break
+        except Exception:
+            continue
+    chosen = preferred or tracks[0]
+    try:
+        base = (chosen.get("baseUrl") or "").strip()
+    except Exception:
+        base = ""
+    return base
+
+
+def _vtt_to_plain_text(vtt_text: str) -> str:
+    if not vtt_text:
+        return ""
+    lines = []
+    for raw in vtt_text.splitlines():
+        s = (raw or "").strip()
+        if not s:
+            continue
+        if s.startswith("WEBVTT") or s.startswith("Kind:") or s.startswith("Language:") or s.startswith("NOTE"):
+            continue
+        if "-->" in s:
+            continue
+        if re.fullmatch(r"\d+", s):
+            continue
+        s = re.sub(r"<[^>]+>", "", s)
+        s = html.unescape(s).strip()
+        if s:
+            lines.append(s)
+    # Deduplicate adjacent duplicate lines.
+    out = []
+    prev = ""
+    for s in lines:
+        if s != prev:
+            out.append(s)
+        prev = s
+    return "\n".join(out)
+
+
+def _extract_meta_description_from_watch_html(html_text: str) -> str:
+    """Best-effort extraction of video description snippet from watch HTML."""
+    if not html_text:
+        return ""
+    m = re.search(
+        r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']',
+        html_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return ""
+    desc = html.unescape((m.group(1) or "").strip())
+    desc = re.sub(r"\s+", " ", desc).strip()
+    return desc[:600]
+
+
+def _fetch_youtube_transcript(video_url: str) -> tuple[bool, str, str]:
+    """
+    Return (ok, video_title, transcript_text).
+    Uses YouTube captions endpoint where available.
+    """
+    video_id = _extract_youtube_video_id(video_url)
+    if not video_id:
+        return False, "", "Could not parse the YouTube video ID."
+    try:
+        watch_html = _fetch_youtube_watch_html(video_id)
+    except Exception as e:
+        return False, "", f"Could not open YouTube watch page: {e}"
+
+    title = ""
+    m_title = re.search(r"<title>(.*?)</title>", watch_html, re.IGNORECASE | re.DOTALL)
+    if m_title:
+        title = html.unescape((m_title.group(1) or "").replace("- YouTube", "").strip())
+
+    base_url = _extract_caption_base_url_from_watch_html(watch_html)
+    if not base_url:
+        return False, title, "No captions were found for this video."
+
+    # Request VTT format for cleaner parsing.
+    parsed = urllib.parse.urlparse(base_url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    qs["fmt"] = ["vtt"]
+    new_query = urllib.parse.urlencode(qs, doseq=True)
+    caption_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
+    try:
+        req = urllib.request.Request(
+            caption_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=35) as resp:
+            vtt = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return False, title, f"Could not download captions: {e}"
+
+    transcript = _vtt_to_plain_text(vtt)
+    # Shorts often have very short caption payloads; keep threshold low.
+    if len(transcript.strip()) < 40:
+        return False, title, "Transcript is too short or unavailable for meaningful commenting."
+    return True, title, transcript
+
+
+def _build_youtube_comment_from_transcript(video_title: str, transcript_text: str) -> tuple[bool, str]:
+    """Generate a concise, human-sounding YouTube comment from transcript."""
+    title = (video_title or "this video").strip()
+    sample = (transcript_text or "").strip()
+    if len(sample) > 5000:
+        sample = sample[:5000]
+    prompt = (
+        "You write one authentic YouTube comment.\n"
+        "Use the transcript to mention one specific insight/value point.\n"
+        "Style: warm, supportive, human, not robotic.\n"
+        "Constraints: 1-2 sentences, max 220 chars, no hashtags, no emojis spam, no quotes.\n"
+        "Return ONLY the final comment text.\n\n"
+        f"Video title: {title}\n\nTranscript:\n{sample}"
+    )
+    payload = json.dumps(
+        {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=70) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        txt = ((data.get("message") or {}).get("content") or "").strip()
+        txt = re.sub(r"\s+", " ", txt).strip().strip('"').strip("'")
+        if not txt:
+            return False, "Comment generation returned empty text."
+        if len(txt) > 230:
+            txt = txt[:227].rstrip() + "..."
+        return True, txt
+    except Exception as e:
+        return False, f"Could not generate comment: {e}"
+
+
+def _build_youtube_comment_from_video_context(video_title: str, context_text: str) -> tuple[bool, str]:
+    """Fallback comment generation when transcript is unavailable (common for Shorts)."""
+    title = (video_title or "this short").strip()
+    ctx = (context_text or "").strip()
+    if len(ctx) > 900:
+        ctx = ctx[:900]
+    prompt = (
+        "Write one friendly YouTube comment for this video.\n"
+        "Style: warm, human, engaging call-to-action.\n"
+        "Constraints: 1-2 sentences, max 180 chars, no hashtags, no spammy emojis.\n"
+        "Return ONLY the final comment text.\n\n"
+        f"Video title: {title}\n"
+        f"Video context: {ctx or 'Short-form video with limited transcript available.'}"
+    )
+    payload = json.dumps(
+        {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=50) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        txt = ((data.get("message") or {}).get("content") or "").strip()
+        txt = re.sub(r"\s+", " ", txt).strip().strip('"').strip("'")
+        if not txt:
+            return False, "Comment generation returned empty text."
+        if len(txt) > 190:
+            txt = txt[:187].rstrip() + "..."
+        return True, txt
+    except Exception as e:
+        return False, f"Could not generate context fallback comment: {e}"
+
+
+def _looks_like_youtube_login_required(page) -> bool:
+    try:
+        url = (page.url or "").lower()
+        if any(k in url for k in ("accounts.google.com", "ServiceLogin".lower(), "/signin")):
+            return True
+    except Exception:
+        pass
+    for sel in (
+        "a[href*='ServiceLogin']",
+        "tp-yt-paper-button:has-text('Sign in')",
+        "ytd-button-renderer:has-text('Sign in')",
+        "text=Sign in",
+    ):
+        loc = page.locator(sel).first
+        try:
+            if loc.count() and loc.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _launch_youtube_context(playwright):
+    """Launch Playwright persistent context for YouTube commenting."""
+    opts = {
+        "user_data_dir": YOUTUBE_PROFILE_DIR,
+        "headless": False,
+        "viewport": {"width": 1360, "height": 900},
+        "ignore_default_args": ["--enable-automation"],
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ],
+    }
+    if YOUTUBE_BROWSER_PATH and os.path.isfile(YOUTUBE_BROWSER_PATH):
+        opts["executable_path"] = YOUTUBE_BROWSER_PATH
+    elif YOUTUBE_BROWSER_CHANNEL in ("chrome", "msedge", "chrome-beta", "msedge-beta", "msedge-dev", "chromium"):
+        opts["channel"] = YOUTUBE_BROWSER_CHANNEL
+    return playwright.chromium.launch_persistent_context(**opts)
+
+
+def _start_youtube_first_login_window() -> tuple[bool, str]:
+    """
+    First-run YouTube login flow: keep browser open for manual login.
+    User should log in with the desired account, then close the window.
+    """
+    global _yt_bootstrap_running
+    with _yt_bootstrap_lock:
+        if _yt_bootstrap_running:
+            return False, "YouTube login window is already open. Finish login there, then close it and try again."
+        _yt_bootstrap_running = True
+
+    def _run():
+        global _yt_bootstrap_running
+        context = None
+        opened = False
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                os.makedirs(YOUTUBE_PROFILE_DIR, exist_ok=True)
+                context = _launch_youtube_context(p)
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto("https://www.youtube.com/", wait_until="domcontentloaded", timeout=90000)
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                opened = True
+                while True:
+                    try:
+                        if not context.pages:
+                            break
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        break
+        except Exception:
+            pass
+        finally:
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            if opened:
+                _mark_youtube_bootstrap_done()
+            with _yt_bootstrap_lock:
+                _yt_bootstrap_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True, (
+        "First-time YouTube login: I opened the browser and left it open. "
+        "Log in with solonaras3@gmail.com, then close that window. After that, run the comment request again."
+    )
+
+
+def _run_youtube_comment(video_url: str) -> tuple[bool, str]:
+    """Transcribe a YouTube video and post an AI-written comment."""
+    if _yt_bootstrap_running:
+        return False, "YouTube login window is still open. Finish login there, then close it and try again."
+    if not _yt_comment_lock.acquire(blocking=False):
+        return False, "YouTube comment automation is already running. Please wait and try again."
+
+    needs_relogin = False
+    context = None
+    try:
+        video_id = _extract_youtube_video_id(video_url)
+        if not video_id:
+            return False, "Please provide a valid YouTube video URL."
+
+        ok_tr, title, transcript = _fetch_youtube_transcript(video_url)
+        comment_text = ""
+        if ok_tr:
+            ok_cmt, comment_text = _build_youtube_comment_from_transcript(title, transcript)
+            if not ok_cmt:
+                comment_text = ""
+        if not comment_text:
+            # Shorts and some videos have no usable captions; fallback to title/description context.
+            context_hint = ""
+            try:
+                watch_html = _fetch_youtube_watch_html(video_id)
+                if not title:
+                    m_title = re.search(r"<title>(.*?)</title>", watch_html, re.IGNORECASE | re.DOTALL)
+                    if m_title:
+                        title = html.unescape((m_title.group(1) or "").replace("- YouTube", "").strip())
+                context_hint = _extract_meta_description_from_watch_html(watch_html)
+            except Exception:
+                pass
+            ok_fallback, comment_text = _build_youtube_comment_from_video_context(title, context_hint)
+            if not ok_fallback or not comment_text:
+                comment_text = "Loved this short. Great energy and clear message - keep these coming!"
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            return False, "Playwright is not installed. Run: pip install playwright && python -m playwright install chromium"
+
+        with sync_playwright() as p:
+            os.makedirs(YOUTUBE_PROFILE_DIR, exist_ok=True)
+            context = _launch_youtube_context(p)
+            page = context.pages[0] if context.pages else context.new_page()
+            watch_url = f"https://www.youtube.com/watch?v={video_id}"
+            source_url = (video_url or "").strip() or watch_url
+            is_shorts = _is_youtube_shorts_url(source_url)
+            # Open the user-provided URL first (including Shorts) so Luna "sees" that content.
+            page.goto(source_url, wait_until="domcontentloaded", timeout=90000)
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+            if _looks_like_youtube_login_required(page):
+                _clear_youtube_bootstrap_done()
+                needs_relogin = True
+                return False, "YouTube needs login again. Opening login window..."
+
+            # Cookie banners can block interactions.
+            for sel in (
+                "button:has-text('Accept all')",
+                "button:has-text('Reject all')",
+                "tp-yt-paper-button:has-text('Accept all')",
+            ):
+                b = page.locator(sel).first
+                try:
+                    if b.count() and b.is_visible():
+                        b.click(timeout=1500)
+                        page.wait_for_timeout(200)
+                except Exception:
+                    pass
+
+            if not _is_youtube_bootstrap_done():
+                _mark_youtube_bootstrap_done()
+
+            # Scroll comments into view.
+            def _locate_comment_placeholder() -> bool:
+                for _ in range(18):
+                    box = page.locator("ytd-comment-simplebox-renderer #simplebox-placeholder").first
+                    try:
+                        if box.count() and box.is_visible():
+                            return True
+                    except Exception:
+                        pass
+                    try:
+                        page.mouse.wheel(0, 1400)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(320)
+                return False
+
+            found = _locate_comment_placeholder()
+            # Shorts UI may not expose the standard comment composer reliably.
+            # Fallback to normal watch page for robust comment posting.
+            if not found and is_shorts:
+                try:
+                    page.goto(watch_url, wait_until="domcontentloaded", timeout=90000)
+                    page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                found = _locate_comment_placeholder()
+
+            if not found:
+                return False, "I couldn't open the YouTube comment box (including Shorts fallback)."
+
+            placeholder = page.locator("ytd-comment-simplebox-renderer #simplebox-placeholder").first
+            try:
+                placeholder.click(timeout=3000, force=True)
+            except Exception:
+                return False, "I found comments but couldn't activate the comment editor."
+
+            editor = page.locator("ytd-comment-simplebox-renderer #contenteditable-root[contenteditable='true']").first
+            if not (editor.count() and editor.is_visible()):
+                return False, "I couldn't find the editable YouTube comment field."
+            try:
+                editor.click(timeout=2500, force=True)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(comment_text, delay=14)
+                page.wait_for_timeout(500)
+            except Exception as e:
+                return False, f"I couldn't type the YouTube comment: {e}"
+
+            submit_btn = page.locator("ytd-commentbox #submit-button button").first
+            if not (submit_btn.count() and submit_btn.is_visible()):
+                submit_btn = page.locator("ytd-commentbox #submit-button").first
+            if not (submit_btn.count() and submit_btn.is_visible()):
+                return False, "I typed the comment but couldn't find the YouTube Post button."
+
+            def _is_enabled(btn):
+                try:
+                    if not btn.count() or not btn.is_visible():
+                        return False
+                    if hasattr(btn, "is_disabled") and btn.is_disabled():
+                        return False
+                    aria = (btn.get_attribute("aria-disabled") or "").lower().strip()
+                    return aria not in ("true", "1")
+                except Exception:
+                    return False
+
+            deadline = time.time() + 8
+            while time.time() < deadline and not _is_enabled(submit_btn):
+                page.wait_for_timeout(250)
+
+            if not _is_enabled(submit_btn):
+                return False, "I typed the YouTube comment, but Post stayed disabled."
+
+            try:
+                submit_btn.click(timeout=5000)
+            except Exception:
+                submit_btn.click(timeout=5000, force=True)
+            page.wait_for_timeout(2000)
+            short_title = (title or video_id).strip()
+            if len(short_title) > 90:
+                short_title = short_title[:87].rstrip() + "..."
+            return True, f"Comment posted on YouTube video: \"{short_title}\""
+    except Exception as e:
+        return False, f"YouTube comment automation error: {e}"
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        if needs_relogin:
+            ok_boot, msg_boot = _start_youtube_first_login_window()
+            if not ok_boot:
+                print(f"YouTube relogin bootstrap could not start: {msg_boot}", flush=True)
+        try:
+            _yt_comment_lock.release()
+        except Exception:
+            pass
+
+
+def _instagram_bootstrap_marker_path() -> str:
+    return os.path.join(INSTAGRAM_PROFILE_DIR, ".login_ready")
+
+
+def _is_instagram_bootstrap_done() -> bool:
+    return os.path.isfile(_instagram_bootstrap_marker_path())
+
+
+def _mark_instagram_bootstrap_done() -> None:
+    try:
+        os.makedirs(INSTAGRAM_PROFILE_DIR, exist_ok=True)
+        with open(_instagram_bootstrap_marker_path(), "w", encoding="utf-8") as f:
+            f.write("ready")
+    except Exception:
+        pass
+
+
+def _clear_instagram_bootstrap_done() -> None:
+    try:
+        marker = _instagram_bootstrap_marker_path()
+        if os.path.isfile(marker):
+            os.unlink(marker)
+    except Exception:
+        pass
+
+
+def _looks_like_instagram_login_required(page) -> bool:
+    try:
+        url = (page.url or "").lower()
+        if any(k in url for k in ("/accounts/login", "login", "challenge")):
+            return True
+    except Exception:
+        pass
+    for sel in ("text=Log in", "text=Login", "input[name='username']"):
+        loc = page.locator(sel).first
+        try:
+            if loc.count() and loc.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _launch_instagram_context(playwright):
+    """Launch Playwright persistent context for Instagram DM automation."""
+    opts = {
+        "user_data_dir": INSTAGRAM_PROFILE_DIR,
+        "headless": False,
+        "viewport": {"width": 1360, "height": 900},
+        "ignore_default_args": ["--enable-automation"],
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ],
+    }
+    if INSTAGRAM_BROWSER_PATH and os.path.isfile(INSTAGRAM_BROWSER_PATH):
+        opts["executable_path"] = INSTAGRAM_BROWSER_PATH
+    elif INSTAGRAM_BROWSER_CHANNEL in ("chrome", "msedge", "chrome-beta", "msedge-beta", "msedge-dev", "chromium"):
+        opts["channel"] = INSTAGRAM_BROWSER_CHANNEL
+    return playwright.chromium.launch_persistent_context(**opts)
+
+
+def _start_instagram_first_login_window() -> tuple[bool, str]:
+    """
+    First-run Instagram login flow: open and keep browser window for manual login.
+    """
+    global _ig_bootstrap_running
+    with _ig_bootstrap_lock:
+        if _ig_bootstrap_running:
+            return False, "Instagram login window is already open. Finish login there, then close it and try again."
+        _ig_bootstrap_running = True
+
+    def _run():
+        global _ig_bootstrap_running
+        context = None
+        opened = False
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                os.makedirs(INSTAGRAM_PROFILE_DIR, exist_ok=True)
+                context = _launch_instagram_context(p)
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(f"{INSTAGRAM_BASE_URL}/", wait_until="domcontentloaded", timeout=90000)
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                opened = True
+                while True:
+                    try:
+                        if not context.pages:
+                            break
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        break
+        except Exception:
+            pass
+        finally:
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            if opened:
+                _mark_instagram_bootstrap_done()
+            with _ig_bootstrap_lock:
+                _ig_bootstrap_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True, (
+        "First-time Instagram login: I opened the browser and left it open. "
+        "Log in with solonaras3@gmail.com, then close that window. After that, run the DM request again."
+    )
+
+
+def _build_instagram_dm_message(username: str, custom_message: str = "") -> str:
+    msg = (custom_message or "").strip()
+    if msg:
+        return msg[:500]
+    templates = [
+        "Hey, I really enjoy your content. Keep it up!",
+        "Hi, great content and great energy - wanted to show some support!",
+        "Hey! I like what you're posting. Keep creating, you're doing great.",
+    ]
+    return random.choice(templates)
+
+
+def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tuple[bool, str]:
+    """Open Instagram profile and send a DM to the provided username."""
+    target = re.sub(r"^@", "", (username or "").strip().lower())
+    if not re.fullmatch(r"[a-z0-9._]{2,30}", target or ""):
+        return False, "Invalid Instagram username. Use only letters, numbers, dots, or underscores."
+    if _ig_bootstrap_running:
+        return False, "Instagram login window is still open. Finish login there, then close it and try again."
+    if not _ig_dm_lock.acquire(blocking=False):
+        return False, "Instagram DM automation is already running. Please wait and try again."
+
+    needs_relogin = False
+    context = None
+    try:
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            return False, "Playwright is not installed. Run: pip install playwright && python -m playwright install chromium"
+
+        dm_text = _build_instagram_dm_message(target, custom_message)
+        profile_url = f"{INSTAGRAM_BASE_URL}/{target}/"
+
+        with sync_playwright() as p:
+            os.makedirs(INSTAGRAM_PROFILE_DIR, exist_ok=True)
+            context = _launch_instagram_context(p)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(profile_url, wait_until="domcontentloaded", timeout=90000)
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+            if _looks_like_instagram_login_required(page):
+                _clear_instagram_bootstrap_done()
+                needs_relogin = True
+                return False, "Instagram needs login again. Opening login window..."
+
+            # Cookies/notification dialogs can block the Message button.
+            for sel in (
+                "button:has-text('Allow all cookies')",
+                "button:has-text('Only allow essential cookies')",
+                "button:has-text('Not Now')",
+            ):
+                b = page.locator(sel).first
+                try:
+                    if b.count() and b.is_visible():
+                        b.click(timeout=1200)
+                        page.wait_for_timeout(220)
+                except Exception:
+                    pass
+
+            if not _is_instagram_bootstrap_done():
+                _mark_instagram_bootstrap_done()
+
+            msg_btn = None
+            for sel in (
+                "header button:has-text('Message')",
+                "section button:has-text('Message')",
+                "button:has-text('Message')",
+                "a[href*='/direct/t/']",
+            ):
+                loc = page.locator(sel).first
+                try:
+                    if loc.count() and loc.is_visible():
+                        msg_btn = loc
+                        break
+                except Exception:
+                    continue
+            if msg_btn is None:
+                return False, "I couldn't find the Instagram Message button on that profile."
+
+            try:
+                msg_btn.click(timeout=5000, force=True)
+                page.wait_for_timeout(1200)
+            except Exception as e:
+                return False, f"I found Message but couldn't open DM composer: {e}"
+
+            editor = None
+            for sel in (
+                "textarea[placeholder='Message...']",
+                "textarea[aria-label='Message']",
+                "div[role='textbox'][contenteditable='true']",
+                "div[contenteditable='true'][aria-label='Message']",
+            ):
+                loc = page.locator(sel).first
+                try:
+                    if loc.count() and loc.is_visible():
+                        editor = loc
+                        break
+                except Exception:
+                    continue
+            if editor is None:
+                return False, "I couldn't find the Instagram DM text box."
+
+            try:
+                editor.click(timeout=4000, force=True)
+                page.keyboard.type(dm_text, delay=14)
+            except Exception as e:
+                return False, f"I couldn't type the Instagram DM: {e}"
+
+            sent = False
+            for sel in (
+                "button:has-text('Send')",
+                "div[role='button']:has-text('Send')",
+            ):
+                b = page.locator(sel).first
+                try:
+                    if b.count() and b.is_visible():
+                        b.click(timeout=3000, force=True)
+                        sent = True
+                        break
+                except Exception:
+                    continue
+            if not sent:
+                try:
+                    page.keyboard.press("Enter")
+                    sent = True
+                except Exception:
+                    pass
+
+            if not sent:
+                return False, "I typed the Instagram DM but couldn't send it."
+
+            page.wait_for_timeout(1500)
+            return True, f"Instagram message sent to @{target}."
+    except Exception as e:
+        return False, f"Instagram DM automation error: {e}"
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        if needs_relogin:
+            ok_boot, msg_boot = _start_instagram_first_login_window()
+            if not ok_boot:
+                print(f"Instagram relogin bootstrap could not start: {msg_boot}", flush=True)
+        try:
+            _ig_dm_lock.release()
+        except Exception:
+            pass
+
+
 def _stream_tts_chunks(text: str):
     """Stream TTS with gTTS: yield SSE events as each chunk is ready."""
     for chunk_text in _split_into_chunks(text):
@@ -2079,7 +3014,7 @@ def _parse_luna_write(reply: str) -> tuple[str, str | None, str | None]:
 
 
 def _handle_web_file_command(msg: str) -> str | None:
-    """If msg is a local command (!read, !write, !list, !edit, !suno, !local_song, !share_song, !share_facebook), run it and return the reply. Else return None."""
+    """If msg is a local command, run it and return reply. Else return None."""
     msg = (msg or "").strip()
     if not msg.startswith("!"):
         return None
@@ -2127,7 +3062,9 @@ def _handle_web_file_command(msg: str) -> str | None:
             "• !suno <description> — open Suno and create a song\n"
             "• !local_song <description> — generate local instrumental + lyrics files\n"
             "• !share_song (or !share song) — share a random YouTube channel song to X\n"
-            "• !share_facebook (or !share facebook) — share a random YouTube channel song to Facebook"
+            "• !share_facebook (or !share facebook) — share a random YouTube channel song to Facebook\n"
+            "• !yt_comment <youtube_url> — transcribe and post a thoughtful YouTube comment\n"
+            "• !ig_dm <username> [message] — send an Instagram DM by username"
         )
     if cmd == "!suno":
         if not args:
@@ -2156,6 +3093,20 @@ def _handle_web_file_command(msg: str) -> str | None:
         return f"✅ {result}" if ok else f"❌ {result}"
     if cmd == "!share" and args.lower().startswith("facebook"):
         ok, result = _run_facebook_share_random_song()
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd in ("!yt_comment", "!youtube_comment", "!comment_youtube"):
+        if not args:
+            return "Usage: !yt_comment <youtube_video_url>"
+        video_url = _extract_youtube_video_url(args) or args.strip()
+        ok, result = _run_youtube_comment(video_url)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd in ("!ig_dm", "!instagram_dm", "!igdm"):
+        if not args:
+            return "Usage: !ig_dm <username> [message]"
+        parts = args.split(None, 1)
+        username = re.sub(r"^@", "", (parts[0] or "").strip())
+        custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
+        ok, result = _run_instagram_dm_by_username(username, custom_message)
         return f"✅ {result}" if ok else f"❌ {result}"
     return None
 
@@ -2197,6 +3148,24 @@ def api_chat():
         append_exchange(scope, msg, file_reply)
         return jsonify({"reply": file_reply})
     tool_intent = _intent_requires_tool_call(msg)
+    ig_username, ig_custom_msg = _extract_instagram_dm_request(msg) if tool_intent else ("", "")
+    if tool_intent and ig_username:
+        announce = f"Opening Instagram and sending a message to @{ig_username}."
+        _play_reply_tts_on_pc(announce)
+        ok, result = _run_instagram_dm_by_username(ig_username, ig_custom_msg)
+        reply = f"✅ {result}" if ok else f"❌ {result}"
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
+    yt_comment_url = _extract_youtube_comment_request(msg) if tool_intent else ""
+    if tool_intent and yt_comment_url:
+        announce = "Opening YouTube, transcribing the video, and posting a thoughtful comment."
+        _play_reply_tts_on_pc(announce)
+        ok, result = _run_youtube_comment(yt_comment_url)
+        reply = f"✅ {result}" if ok else f"❌ {result}"
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
     # Local song/lyrics generation (fully local files, no Suno)
     local_desc = _extract_local_song_description(msg) if tool_intent else ""
     if tool_intent and local_desc:
@@ -2364,6 +3333,28 @@ async def on_message(message: discord.Message):
             await message.reply(f"{mention} {reply}")
             return
         tool_intent = await asyncio.to_thread(_intent_requires_tool_call, text)
+        ig_username, ig_custom_msg = _extract_instagram_dm_request(text) if tool_intent else ("", "")
+        if tool_intent and ig_username:
+            if not _can_use_instagram_dm_discord(message.author.id):
+                reply = "Only the linked user/admin can use Instagram DM automation on Discord."
+            else:
+                await message.reply(f"{mention} Opening Instagram and messaging @{ig_username} now...")
+                ok, result = await asyncio.to_thread(_run_instagram_dm_by_username, ig_username, ig_custom_msg)
+                reply = f"✅ {result}" if ok else f"❌ {result}"
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        yt_comment_url = _extract_youtube_comment_request(text) if tool_intent else ""
+        if tool_intent and yt_comment_url:
+            if not _can_use_youtube_comment_discord(message.author.id):
+                reply = "Only the linked user/admin can use YouTube comment automation on Discord."
+            else:
+                await message.reply(f"{mention} Transcribing this YouTube video and posting a comment now...")
+                ok, result = await asyncio.to_thread(_run_youtube_comment, yt_comment_url)
+                reply = f"✅ {result}" if ok else f"❌ {result}"
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
         # Local song/lyrics generation from Discord
         local_desc = _extract_local_song_description(text) if tool_intent else ""
         if tool_intent and local_desc:
@@ -2597,6 +3588,40 @@ async def cmd_share_facebook(ctx: commands.Context):
         return
     await ctx.reply("Picking a random song from your YouTube channel and sharing it to Facebook...")
     ok, result = await asyncio.to_thread(_run_facebook_share_random_song)
+    await ctx.reply(f"{'✅' if ok else '❌'} {result}")
+
+
+@bot.command(name="yt_comment")
+async def cmd_yt_comment(ctx: commands.Context, *, video_url: str = ""):
+    """Transcribe a YouTube video and post a thoughtful comment (linked/admin only)."""
+    if not _can_use_youtube_comment_discord(ctx.author.id):
+        await ctx.reply("Only the linked user/admin can use YouTube comment automation.")
+        return
+    raw = (video_url or "").strip()
+    target = _extract_youtube_video_url(raw) or raw
+    if not target:
+        await ctx.reply("Usage: `!yt_comment <youtube_video_url>`")
+        return
+    await ctx.reply("Opening YouTube, transcribing the video, and posting a comment...")
+    ok, result = await asyncio.to_thread(_run_youtube_comment, target)
+    await ctx.reply(f"{'✅' if ok else '❌'} {result}")
+
+
+@bot.command(name="ig_dm")
+async def cmd_ig_dm(ctx: commands.Context, *, args: str = ""):
+    """Send an Instagram DM by username (linked/admin only)."""
+    if not _can_use_instagram_dm_discord(ctx.author.id):
+        await ctx.reply("Only the linked user/admin can use Instagram DM automation.")
+        return
+    text = (args or "").strip()
+    if not text:
+        await ctx.reply("Usage: `!ig_dm <username> [message]`")
+        return
+    parts = text.split(None, 1)
+    username = re.sub(r"^@", "", (parts[0] or "").strip())
+    custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
+    await ctx.reply(f"Opening Instagram and messaging @{username}...")
+    ok, result = await asyncio.to_thread(_run_instagram_dm_by_username, username, custom_message)
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
 
 
