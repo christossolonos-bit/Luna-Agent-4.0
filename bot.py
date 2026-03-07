@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
+from collections import deque
 
 import discord
 from discord.ext import commands
@@ -382,6 +383,284 @@ bot = commands.Bot(
 
 # Last assistant reply per scope (Discord) for profile-from-question capture
 _last_assistant_by_scope: dict[str, str] = {}
+
+# Discord music state (per guild) for YouTube playback queue.
+_music_states: dict[int, dict] = {}
+_music_state_lock = threading.Lock()
+_FFMPEG_BEFORE_OPTS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+_FFMPEG_OPTS = "-vn"
+
+
+def _cleanup_track_temp_file(track: dict | None) -> None:
+    """Delete downloaded temporary audio file for a track, if any."""
+    if not isinstance(track, dict):
+        return
+    fp = (track.get("local_path") or "").strip()
+    if not fp:
+        return
+    try:
+        if os.path.isfile(fp):
+            os.unlink(fp)
+    except Exception:
+        pass
+
+
+def _music_state_for_guild(guild_id: int) -> dict:
+    with _music_state_lock:
+        state = _music_states.get(guild_id)
+        if state is None:
+            state = {"queue": deque(), "current": None}
+            _music_states[guild_id] = state
+        return state
+
+
+def _clear_music_state_for_guild(guild_id: int) -> None:
+    with _music_state_lock:
+        old = _music_states.get(guild_id) or {"queue": deque(), "current": None}
+        try:
+            _cleanup_track_temp_file(old.get("current"))
+            for t in list(old.get("queue") or []):
+                _cleanup_track_temp_file(t)
+        except Exception:
+            pass
+        _music_states[guild_id] = {"queue": deque(), "current": None}
+
+
+def _resolve_youtube_track(query: str) -> tuple[bool, dict | str]:
+    """Resolve a YouTube URL/search query into direct audio stream info using yt-dlp."""
+    q = (query or "").strip()
+    if not q:
+        return False, "Please provide a YouTube URL or search terms."
+    try:
+        import yt_dlp
+    except Exception:
+        return False, "yt-dlp is not installed. Run: pip install yt-dlp"
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch1",
+        "extract_flat": False,
+        "skip_download": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(q, download=False)
+        if info is None:
+            return False, "No results found."
+        if "entries" in info and info.get("entries"):
+            info = next((e for e in info["entries"] if e), None)
+        if not info:
+            return False, "No playable result found."
+        stream_url = (info.get("url") or "").strip()
+        # Prefer direct audio formats if top-level url is missing.
+        if not stream_url:
+            for f in (info.get("formats") or []):
+                if not isinstance(f, dict):
+                    continue
+                acodec = (f.get("acodec") or "").lower()
+                vcodec = (f.get("vcodec") or "").lower()
+                u = (f.get("url") or "").strip()
+                if u and acodec not in ("", "none") and vcodec in ("none", ""):
+                    stream_url = u
+                    break
+        if not stream_url:
+            return False, "Could not resolve audio stream URL."
+        title = (info.get("title") or "Unknown title").strip()
+        web_url = (info.get("webpage_url") or info.get("original_url") or q).strip()
+        duration = int(info.get("duration") or 0)
+        headers = info.get("http_headers") or {}
+        return True, {
+            "title": title,
+            "web_url": web_url,
+            "stream_url": stream_url,
+            "duration": duration,
+            "http_headers": headers if isinstance(headers, dict) else {},
+        }
+    except Exception as e:
+        return False, f"Could not resolve YouTube audio: {e}"
+
+
+def _download_youtube_audio_temp(web_url: str) -> tuple[bool, str]:
+    """Download YouTube audio to a temp file for stable Discord playback."""
+    src = (web_url or "").strip()
+    if not src:
+        return False, "Missing source URL for download fallback."
+    try:
+        import yt_dlp
+    except Exception:
+        return False, "yt-dlp is not installed."
+    try:
+        temp_dir = os.path.join(tempfile.gettempdir(), "luna_music_cache")
+        os.makedirs(temp_dir, exist_ok=True)
+        token = str(int(time.time() * 1000))
+        outtmpl = os.path.join(temp_dir, f"luna_{token}_%(id)s.%(ext)s")
+        ydl_opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": outtmpl,
+            "restrictfilenames": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(src, download=True)
+            path = ""
+            requested = info.get("requested_downloads") if isinstance(info, dict) else None
+            if isinstance(requested, list) and requested:
+                path = (requested[0].get("filepath") or "").strip()
+            if not path:
+                path = ydl.prepare_filename(info)
+        if not path or not os.path.isfile(path):
+            return False, "Download fallback failed to produce a local file."
+        return True, path
+    except Exception as e:
+        return False, f"Download fallback failed: {e}"
+
+
+def _fmt_seconds(sec: int) -> str:
+    s = max(int(sec or 0), 0)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
+async def _announce_music_now_playing(guild_id: int, track: dict) -> None:
+    channel_id = int(track.get("request_channel_id") or 0)
+    if not channel_id:
+        return
+    ch = bot.get_channel(channel_id)
+    if not ch:
+        return
+    try:
+        dur = _fmt_seconds(int(track.get("duration") or 0))
+        dur_part = f" ({dur})" if int(track.get("duration") or 0) > 0 else ""
+        await ch.send(f"🎵 Now playing: **{track.get('title','Unknown')}**{dur_part}\n{track.get('web_url','')}")
+    except Exception:
+        pass
+
+
+def _start_next_music_track(guild_id: int, voice_client: discord.VoiceClient) -> bool:
+    state = _music_state_for_guild(guild_id)
+    if voice_client.is_playing() or voice_client.is_paused():
+        return True
+    if not state["queue"]:
+        state["current"] = None
+        return False
+    track = state["queue"].popleft()
+    track["_retry_count"] = int(track.get("_retry_count") or 0)
+    track["_started_monotonic"] = time.monotonic()
+    state["current"] = track
+    local_path = (track.get("local_path") or "").strip()
+    if local_path and os.path.isfile(local_path):
+        source = discord.FFmpegPCMAudio(
+            local_path,
+            before_options="-nostdin",
+            options=_FFMPEG_OPTS,
+        )
+    else:
+        headers = track.get("http_headers") or {}
+        header_lines = []
+        if isinstance(headers, dict):
+            # Pass essential headers to avoid YouTube 403/empty stream in ffmpeg.
+            for k in ("User-Agent", "Referer", "Accept-Language", "Cookie"):
+                v = (headers.get(k) or "").strip()
+                if v:
+                    clean_v = v.replace("\r", " ").replace("\n", " ").strip()
+                    header_lines.append(f"{k}: {clean_v}")
+        header_opt = ""
+        if header_lines:
+            header_opt = f' -headers "{ "\\r\\n".join(header_lines) }\\r\\n"'
+        before_opts = f"{_FFMPEG_BEFORE_OPTS}{header_opt} -nostdin"
+
+        source = discord.FFmpegPCMAudio(
+            track["stream_url"],
+            before_options=before_opts,
+            options=_FFMPEG_OPTS,
+        )
+
+    def _after_play(err):
+        if err:
+            print(f"[Luna music] Playback error: {err}", flush=True)
+        try:
+            asyncio.run_coroutine_threadsafe(_on_music_track_end(guild_id, err), bot.loop)
+        except Exception:
+            pass
+
+    voice_client.play(source, after=_after_play)
+    try:
+        asyncio.run_coroutine_threadsafe(_announce_music_now_playing(guild_id, track), bot.loop)
+    except Exception:
+        pass
+    return True
+
+
+async def _on_music_track_end(guild_id: int, err=None) -> None:
+    guild = bot.get_guild(guild_id)
+    if not guild or not guild.voice_client or not guild.voice_client.is_connected():
+        _clear_music_state_for_guild(guild_id)
+        return
+    state = _music_state_for_guild(guild_id)
+    manual_skip = bool(state.pop("manual_skip", False))
+    current = state.get("current")
+    if current:
+        started = float(current.get("_started_monotonic") or 0.0)
+        elapsed = max(0.0, time.monotonic() - started) if started > 0 else 0.0
+        duration = int(current.get("duration") or 0)
+        retry_count = int(current.get("_retry_count") or 0)
+        local_path = (current.get("local_path") or "").strip()
+
+        # If ffmpeg dies early, don't treat it as completed playback.
+        if duration > 0:
+            ended_too_soon = elapsed < max(20.0, duration * 0.60)
+        else:
+            ended_too_soon = elapsed < 8.0
+
+        if (not manual_skip) and ended_too_soon and retry_count < 1:
+            web_url = (current.get("web_url") or "").strip()
+            if web_url:
+                ok, refreshed = await asyncio.to_thread(_resolve_youtube_track, web_url)
+                if ok and isinstance(refreshed, dict) and refreshed.get("stream_url"):
+                    refreshed["request_channel_id"] = current.get("request_channel_id")
+                    refreshed["_retry_count"] = retry_count + 1
+                    state["current"] = None
+                    state["queue"].appendleft(refreshed)
+                    ch = bot.get_channel(int(current.get("request_channel_id") or 0))
+                    if ch:
+                        try:
+                            await ch.send("🔁 Stream dropped early, retrying this track once...")
+                        except Exception:
+                            pass
+                    _start_next_music_track(guild_id, guild.voice_client)
+                    return
+        if (not manual_skip) and ended_too_soon and retry_count < 2 and not local_path:
+            web_url = (current.get("web_url") or "").strip()
+            if web_url:
+                ok_dl, dl = await asyncio.to_thread(_download_youtube_audio_temp, web_url)
+                if ok_dl:
+                    current["local_path"] = dl
+                    current["_retry_count"] = retry_count + 1
+                    current["_started_monotonic"] = 0.0
+                    state["current"] = None
+                    state["queue"].appendleft(current)
+                    ch = bot.get_channel(int(current.get("request_channel_id") or 0))
+                    if ch:
+                        try:
+                            await ch.send("📥 Stream is unstable. Downloading this track for stable playback and retrying...")
+                        except Exception:
+                            pass
+                    _start_next_music_track(guild_id, guild.voice_client)
+                    return
+
+        # Track finished (or skipped) -> clean temp file.
+        _cleanup_track_temp_file(current)
+
+    state["current"] = None
+    _start_next_music_track(guild_id, guild.voice_client)
 
 
 def _build_system_prompt(base: str | None, memory_scope: str | None) -> str | None:
@@ -4029,6 +4308,147 @@ async def cmd_profile(ctx: commands.Context, *, args: str = ""):
     await ctx.reply(text)
 
 
+@bot.command(name="play")
+async def cmd_play(ctx: commands.Context, *, query: str = ""):
+    """Play YouTube audio in voice channel. Usage: !play <url or search>"""
+    if not ctx.guild:
+        await ctx.reply("Music playback is only available in a server voice channel.")
+        return
+    q = (query or "").strip()
+    if not q:
+        await ctx.reply("Usage: `!play <youtube url or search terms>`")
+        return
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.reply("Join a voice channel first, then use `!play`.")
+        return
+
+    vc = ctx.voice_client
+    target_channel = ctx.author.voice.channel
+    try:
+        if vc and vc.is_connected():
+            if vc.channel.id != target_channel.id:
+                await vc.move_to(target_channel)
+        else:
+            vc = await target_channel.connect()
+    except Exception as e:
+        await ctx.reply(f"Couldn't join voice channel: {e}")
+        return
+
+    await ctx.reply(f"Searching YouTube for: `{q}` ...")
+    ok, result = await asyncio.to_thread(_resolve_youtube_track, q)
+    if not ok:
+        await ctx.reply(f"❌ {result}")
+        return
+
+    track = result
+    track["request_channel_id"] = ctx.channel.id
+    state = _music_state_for_guild(ctx.guild.id)
+    state["queue"].append(track)
+    queued_pos = len(state["queue"])
+
+    started = False
+    if vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused() and state.get("current") is None:
+        started = _start_next_music_track(ctx.guild.id, vc)
+
+    if started:
+        await ctx.reply(f"▶️ Starting playback: **{track.get('title','Unknown')}**")
+    else:
+        await ctx.reply(f"➕ Added to queue (#{queued_pos}): **{track.get('title','Unknown')}**")
+
+
+@bot.command(name="pause")
+async def cmd_pause(ctx: commands.Context):
+    """Pause current music playback."""
+    vc = ctx.voice_client
+    if not vc or not vc.is_connected():
+        await ctx.reply("I'm not in a voice channel.")
+        return
+    if vc.is_playing():
+        vc.pause()
+        await ctx.reply("⏸️ Paused.")
+    else:
+        await ctx.reply("Nothing is playing right now.")
+
+
+@bot.command(name="resume")
+async def cmd_resume(ctx: commands.Context):
+    """Resume paused music playback."""
+    vc = ctx.voice_client
+    if not vc or not vc.is_connected():
+        await ctx.reply("I'm not in a voice channel.")
+        return
+    if vc.is_paused():
+        vc.resume()
+        await ctx.reply("▶️ Resumed.")
+    else:
+        await ctx.reply("Playback is not paused.")
+
+
+@bot.command(name="skip")
+async def cmd_skip(ctx: commands.Context):
+    """Skip current track and play the next queued one."""
+    vc = ctx.voice_client
+    if not vc or not vc.is_connected():
+        await ctx.reply("I'm not in a voice channel.")
+        return
+    if vc.is_playing() or vc.is_paused():
+        if ctx.guild:
+            _music_state_for_guild(ctx.guild.id)["manual_skip"] = True
+        vc.stop()
+        await ctx.reply("⏭️ Skipped.")
+    else:
+        await ctx.reply("Nothing is playing right now.")
+
+
+@bot.command(name="stop")
+async def cmd_stop(ctx: commands.Context):
+    """Stop playback and clear queue."""
+    if not ctx.guild:
+        await ctx.reply("This command is only available in a server.")
+        return
+    vc = ctx.voice_client
+    state = _music_state_for_guild(ctx.guild.id)
+    state["manual_skip"] = True
+    state["queue"].clear()
+    _cleanup_track_temp_file(state.get("current"))
+    state["current"] = None
+    if vc and (vc.is_playing() or vc.is_paused()):
+        vc.stop()
+    await ctx.reply("⏹️ Stopped playback and cleared the queue.")
+
+
+@bot.command(name="queue")
+async def cmd_queue(ctx: commands.Context):
+    """Show now playing and upcoming tracks."""
+    if not ctx.guild:
+        await ctx.reply("This command is only available in a server.")
+        return
+    state = _music_state_for_guild(ctx.guild.id)
+    current = state.get("current")
+    queued = list(state.get("queue") or [])
+    if not current and not queued:
+        await ctx.reply("Queue is empty. Use `!play <url or search>`.")
+        return
+
+    lines = []
+    if current:
+        cur_dur = _fmt_seconds(int(current.get("duration") or 0))
+        cur_dur = f" ({cur_dur})" if int(current.get("duration") or 0) > 0 else ""
+        lines.append(f"🎵 **Now playing:** {current.get('title','Unknown')}{cur_dur}")
+    if queued:
+        lines.append("📜 **Up next:**")
+        for i, t in enumerate(queued[:10], 1):
+            dur = _fmt_seconds(int(t.get("duration") or 0))
+            dur = f" ({dur})" if int(t.get("duration") or 0) > 0 else ""
+            lines.append(f"{i}. {t.get('title','Unknown')}{dur}")
+        if len(queued) > 10:
+            lines.append(f"... and {len(queued) - 10} more")
+    out = "\n".join(lines)
+    if len(out) > 1900:
+        out = out[:1897] + "..."
+    await ctx.reply(out)
+
+
 @bot.command(name="join")
 async def cmd_join(ctx: commands.Context):
     """Find a voice channel with someone in it and join. Stays until you use !leave."""
@@ -4068,6 +4488,14 @@ async def cmd_leave(ctx: commands.Context):
     if not ctx.voice_client or not ctx.voice_client.is_connected():
         await ctx.reply("I'm not in a voice channel.")
         return
+    if ctx.guild:
+        _music_state_for_guild(ctx.guild.id)["manual_skip"] = True
+        _clear_music_state_for_guild(ctx.guild.id)
+    try:
+        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            ctx.voice_client.stop()
+    except Exception:
+        pass
     channel_name = ctx.voice_client.channel.name
     await ctx.voice_client.disconnect()
     await ctx.reply(f"Left **{channel_name}**.")
