@@ -824,7 +824,7 @@ def _extract_youtube_comment_request(text: str) -> str:
 def _extract_instagram_dm_request(text: str) -> tuple[str, str]:
     """
     Extract Instagram DM target + optional message.
-    Returns (username, message). username is empty if no request found.
+    Returns (target, message). Target can be username or direct thread URL.
     """
     raw = (text or "").strip()
     if not raw:
@@ -834,7 +834,9 @@ def _extract_instagram_dm_request(text: str) -> tuple[str, str]:
         parts = raw.split(None, 2)
         if len(parts) < 2:
             return "", ""
-        username = re.sub(r"^@", "", (parts[1] or "").strip())
+        first = (parts[1] or "").strip()
+        direct = _extract_instagram_thread_url(first)
+        username = re.sub(r"^@", "", first) if not direct else direct
         msg = (parts[2] or "").strip() if len(parts) > 2 else ""
         return username, msg
 
@@ -850,7 +852,23 @@ def _extract_instagram_dm_request(text: str) -> tuple[str, str]:
             m_msg = re.search(r'"([^"]{3,280})"', raw)
             msg = (m_msg.group(1) or "").strip() if m_msg else ""
             return username, msg
+    direct = _extract_instagram_thread_url(raw)
+    if direct and re.search(r"\b(?:instagram|insta|ig)\b", low, re.IGNORECASE):
+        m_msg = re.search(r'"([^"]{3,280})"', raw)
+        msg = (m_msg.group(1) or "").strip() if m_msg else ""
+        return direct, msg
     return "", ""
+
+
+def _extract_instagram_thread_url(text: str) -> str:
+    """Extract instagram direct thread URL (https://www.instagram.com/direct/t/<id>)."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    m = re.search(r"(https?://(?:www\.)?instagram\.com/direct/t/\d+/?[^\s]*)", raw, re.IGNORECASE)
+    if not m:
+        return ""
+    return (m.group(1) or "").strip().rstrip(".,!?")
 
 
 def _intent_requires_tool_call(text: str) -> bool:
@@ -2779,6 +2797,198 @@ def _build_instagram_dm_message(username: str, custom_message: str = "") -> str:
     return random.choice(templates)
 
 
+def _send_instagram_message_in_open_thread(page, dm_text: str) -> tuple[bool, str]:
+    """Send message in currently open Instagram thread."""
+    composer = None
+    composer_selectors = (
+        "main form",
+        "div[role='main'] form",
+        "footer form",
+        "form",
+    )
+    # Let thread UI settle before searching the bottom composer.
+    wait_deadline = time.time() + 15
+    while time.time() < wait_deadline and composer is None:
+        for sel in composer_selectors:
+            loc = page.locator(sel).last
+            try:
+                if loc.count() and loc.is_visible():
+                    composer = loc
+                    break
+            except Exception:
+                continue
+        if composer is None:
+            page.wait_for_timeout(350)
+
+    editor = None
+    editor_selectors = (
+        "textarea[placeholder='Message...']",
+        "textarea[placeholder='Message']",
+        "textarea[aria-label='Message']",
+        "div[role='textbox'][aria-label='Message'][contenteditable='true']",
+        "div[contenteditable='true'][aria-label='Message']",
+        "div[role='textbox'][contenteditable='true']",
+        "p[contenteditable='true']",
+    )
+    wait_deadline = time.time() + 15
+    while time.time() < wait_deadline and editor is None:
+        if composer is not None:
+            for sel in editor_selectors:
+                loc = composer.locator(sel).first
+                try:
+                    if loc.count() and loc.is_visible():
+                        editor = loc
+                        break
+                except Exception:
+                    continue
+        if editor is None:
+            for sel in editor_selectors:
+                loc = page.locator(sel).last
+                try:
+                    if loc.count() and loc.is_visible():
+                        editor = loc
+                        break
+                except Exception:
+                    continue
+        if editor is None:
+            page.wait_for_timeout(350)
+    if editor is None:
+        return False, "I couldn't find the Instagram DM text box at the bottom."
+
+    try:
+        editor.scroll_into_view_if_needed(timeout=2500)
+    except Exception:
+        pass
+    try:
+        editor.click(timeout=4000, force=True)
+        # Type slower so the user can visibly watch the message being written.
+        page.keyboard.type(dm_text, delay=26)
+        page.wait_for_timeout(1100)
+    except Exception as e:
+        return False, f"I couldn't type the Instagram DM: {e}"
+
+    sent = False
+    send_selectors = (
+        "button[type='submit']",
+        "button:has-text('Send')",
+        "div[role='button']:has-text('Send')",
+    )
+    if composer is not None:
+        for sel in send_selectors:
+            b = composer.locator(sel).last
+            try:
+                if b.count() and b.is_visible():
+                    b.click(timeout=3500, force=True)
+                    sent = True
+                    break
+            except Exception:
+                continue
+    if not sent:
+        for sel in send_selectors:
+            b = page.locator(sel).last
+            try:
+                if b.count() and b.is_visible():
+                    b.click(timeout=3500, force=True)
+                    sent = True
+                    break
+            except Exception:
+                continue
+    if not sent:
+        try:
+            page.keyboard.press("Enter")
+            sent = True
+        except Exception:
+            pass
+
+    if not sent:
+        return False, "I typed the Instagram DM but couldn't press Send on the right side."
+    page.wait_for_timeout(1500)
+    return True, "sent"
+
+
+def _run_instagram_dm_by_thread_url(thread_url: str, custom_message: str = "") -> tuple[bool, str]:
+    """Open a direct Instagram thread URL and send a DM."""
+    target_url = _extract_instagram_thread_url(thread_url)
+    if not target_url:
+        return False, "Invalid Instagram thread URL."
+    if _ig_bootstrap_running:
+        return False, "Instagram login window is still open. Finish login there, then close it and try again."
+    if not _ig_dm_lock.acquire(blocking=False):
+        return False, "Instagram DM automation is already running. Please wait and try again."
+
+    needs_relogin = False
+    context = None
+    try:
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            return False, "Playwright is not installed. Run: pip install playwright && python -m playwright install chromium"
+
+        dm_text = _build_instagram_dm_message("friend", custom_message)
+        with sync_playwright() as p:
+            os.makedirs(INSTAGRAM_PROFILE_DIR, exist_ok=True)
+            context = _launch_instagram_context(p)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+            if _looks_like_instagram_login_required(page):
+                _clear_instagram_bootstrap_done()
+                needs_relogin = True
+                return False, "Instagram needs login again. Opening login window..."
+
+            for sel in (
+                "button:has-text('Allow all cookies')",
+                "button:has-text('Only allow essential cookies')",
+                "button:has-text('Not Now')",
+            ):
+                b = page.locator(sel).first
+                try:
+                    if b.count() and b.is_visible():
+                        b.click(timeout=1200)
+                        page.wait_for_timeout(220)
+                except Exception:
+                    pass
+
+            if not _is_instagram_bootstrap_done():
+                _mark_instagram_bootstrap_done()
+
+            ok_send, send_msg = _send_instagram_message_in_open_thread(page, dm_text)
+            if not ok_send:
+                return False, send_msg
+            return True, "Instagram message sent in the provided thread."
+    except Exception as e:
+        return False, f"Instagram DM automation error: {e}"
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        if needs_relogin:
+            ok_boot, msg_boot = _start_instagram_first_login_window()
+            if not ok_boot:
+                print(f"Instagram relogin bootstrap could not start: {msg_boot}", flush=True)
+        try:
+            _ig_dm_lock.release()
+        except Exception:
+            pass
+
+
+def _run_instagram_dm(target: str, custom_message: str = "") -> tuple[bool, str]:
+    """Dispatch Instagram DM by username or direct thread URL."""
+    target_text = (target or "").strip()
+    if not target_text:
+        return False, "Missing Instagram target."
+    direct = _extract_instagram_thread_url(target_text)
+    if direct:
+        return _run_instagram_dm_by_thread_url(direct, custom_message)
+    return _run_instagram_dm_by_username(target_text, custom_message)
+
+
 def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tuple[bool, str]:
     """Open Instagram profile and send a DM to the provided username."""
     target = re.sub(r"^@", "", (username or "").strip().lower())
@@ -2798,13 +3008,13 @@ def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tu
             return False, "Playwright is not installed. Run: pip install playwright && python -m playwright install chromium"
 
         dm_text = _build_instagram_dm_message(target, custom_message)
-        profile_url = f"{INSTAGRAM_BASE_URL}/{target}/"
+        inbox_url = f"{INSTAGRAM_BASE_URL}/direct/inbox/"
 
         with sync_playwright() as p:
             os.makedirs(INSTAGRAM_PROFILE_DIR, exist_ok=True)
             context = _launch_instagram_context(p)
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(profile_url, wait_until="domcontentloaded", timeout=90000)
+            page.goto(inbox_url, wait_until="domcontentloaded", timeout=90000)
             try:
                 page.bring_to_front()
             except Exception:
@@ -2832,28 +3042,68 @@ def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tu
             if not _is_instagram_bootstrap_done():
                 _mark_instagram_bootstrap_done()
 
-            msg_btn = None
-            for sel in (
-                "header button:has-text('Message')",
-                "section button:has-text('Message')",
-                "button:has-text('Message')",
-                "a[href*='/direct/t/']",
-            ):
-                loc = page.locator(sel).first
-                try:
-                    if loc.count() and loc.is_visible():
-                        msg_btn = loc
-                        break
-                except Exception:
-                    continue
-            if msg_btn is None:
-                return False, "I couldn't find the Instagram Message button on that profile."
+            def _open_thread_in_inbox() -> tuple[bool, str]:
+                # 1) Try existing thread in left conversation list.
+                for sel in (
+                    f"main a[href*='/direct/t/']:has-text('{target}')",
+                    f"main div[role='button']:has-text('{target}')",
+                    f"main span:has-text('{target}')",
+                ):
+                    loc = page.locator(sel).first
+                    try:
+                        if loc.count() and loc.is_visible():
+                            loc.click(timeout=3500, force=True)
+                            page.wait_for_timeout(900)
+                            return True, "thread-opened"
+                    except Exception:
+                        continue
 
-            try:
-                msg_btn.click(timeout=5000, force=True)
-                page.wait_for_timeout(1200)
-            except Exception as e:
-                return False, f"I found Message but couldn't open DM composer: {e}"
+                # 2) Use inbox search exactly like your screenshot flow.
+                search_box = None
+                for sel in (
+                    "aside input[placeholder='Search']",
+                    "aside input[aria-label='Search input']",
+                    "input[placeholder='Search']",
+                    "input[aria-label='Search input']",
+                ):
+                    loc = page.locator(sel).first
+                    try:
+                        if loc.count() and loc.is_visible():
+                            search_box = loc
+                            break
+                    except Exception:
+                        continue
+                if search_box is None:
+                    return False, "I couldn't find the Instagram inbox search box."
+
+                try:
+                    search_box.click(timeout=3000, force=True)
+                    page.keyboard.press("Control+A")
+                    page.keyboard.press("Backspace")
+                    page.keyboard.type(target, delay=12)
+                    page.wait_for_timeout(1200)
+                except Exception as e:
+                    return False, f"I couldn't type in Instagram inbox search: {e}"
+
+                for sel in (
+                    f"aside a[href*='/direct/t/']:has-text('{target}')",
+                    f"aside div[role='button']:has-text('{target}')",
+                    f"div[role='dialog'] [role='button']:has-text('{target}')",
+                    f"main a[href*='/direct/t/']:has-text('{target}')",
+                ):
+                    loc = page.locator(sel).first
+                    try:
+                        if loc.count() and loc.is_visible():
+                            loc.click(timeout=4000, force=True)
+                            page.wait_for_timeout(900)
+                            return True, "thread-opened-search"
+                    except Exception:
+                        continue
+                return False, f"I couldn't find @{target} in Instagram inbox results."
+
+            ok_thread, thread_msg = _open_thread_in_inbox()
+            if not ok_thread:
+                return False, thread_msg
 
             editor = None
             for sel in (
@@ -2861,6 +3111,7 @@ def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tu
                 "textarea[aria-label='Message']",
                 "div[role='textbox'][contenteditable='true']",
                 "div[contenteditable='true'][aria-label='Message']",
+                "div[aria-label='Message'][contenteditable='true']",
             ):
                 loc = page.locator(sel).first
                 try:
@@ -2874,7 +3125,9 @@ def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tu
 
             try:
                 editor.click(timeout=4000, force=True)
-                page.keyboard.type(dm_text, delay=14)
+                # Type slower so the user can visibly watch the message being written.
+                page.keyboard.type(dm_text, delay=26)
+                page.wait_for_timeout(1100)
             except Exception as e:
                 return False, f"I couldn't type the Instagram DM: {e}"
 
@@ -3064,7 +3317,7 @@ def _handle_web_file_command(msg: str) -> str | None:
             "• !share_song (or !share song) — share a random YouTube channel song to X\n"
             "• !share_facebook (or !share facebook) — share a random YouTube channel song to Facebook\n"
             "• !yt_comment <youtube_url> — transcribe and post a thoughtful YouTube comment\n"
-            "• !ig_dm <username> [message] — send an Instagram DM by username"
+            "• !ig_dm <username|thread_url> [message] — send an Instagram DM"
         )
     if cmd == "!suno":
         if not args:
@@ -3102,11 +3355,11 @@ def _handle_web_file_command(msg: str) -> str | None:
         return f"✅ {result}" if ok else f"❌ {result}"
     if cmd in ("!ig_dm", "!instagram_dm", "!igdm"):
         if not args:
-            return "Usage: !ig_dm <username> [message]"
+            return "Usage: !ig_dm <username|instagram_direct_thread_url> [message]"
         parts = args.split(None, 1)
-        username = re.sub(r"^@", "", (parts[0] or "").strip())
+        target = (parts[0] or "").strip()
         custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
-        ok, result = _run_instagram_dm_by_username(username, custom_message)
+        ok, result = _run_instagram_dm(target, custom_message)
         return f"✅ {result}" if ok else f"❌ {result}"
     return None
 
@@ -3150,9 +3403,10 @@ def api_chat():
     tool_intent = _intent_requires_tool_call(msg)
     ig_username, ig_custom_msg = _extract_instagram_dm_request(msg) if tool_intent else ("", "")
     if tool_intent and ig_username:
-        announce = f"Opening Instagram and sending a message to @{ig_username}."
+        announce_target = ig_username if _extract_instagram_thread_url(ig_username) else f"@{ig_username}"
+        announce = f"Opening Instagram and sending a message to {announce_target}."
         _play_reply_tts_on_pc(announce)
-        ok, result = _run_instagram_dm_by_username(ig_username, ig_custom_msg)
+        ok, result = _run_instagram_dm(ig_username, ig_custom_msg)
         reply = f"✅ {result}" if ok else f"❌ {result}"
         append_exchange(scope, msg, reply)
         _play_reply_tts_on_pc(reply)
@@ -3338,8 +3592,9 @@ async def on_message(message: discord.Message):
             if not _can_use_instagram_dm_discord(message.author.id):
                 reply = "Only the linked user/admin can use Instagram DM automation on Discord."
             else:
-                await message.reply(f"{mention} Opening Instagram and messaging @{ig_username} now...")
-                ok, result = await asyncio.to_thread(_run_instagram_dm_by_username, ig_username, ig_custom_msg)
+                announce_target = ig_username if _extract_instagram_thread_url(ig_username) else f"@{ig_username}"
+                await message.reply(f"{mention} Opening Instagram and messaging {announce_target} now...")
+                ok, result = await asyncio.to_thread(_run_instagram_dm, ig_username, ig_custom_msg)
                 reply = f"✅ {result}" if ok else f"❌ {result}"
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
@@ -3609,19 +3864,20 @@ async def cmd_yt_comment(ctx: commands.Context, *, video_url: str = ""):
 
 @bot.command(name="ig_dm")
 async def cmd_ig_dm(ctx: commands.Context, *, args: str = ""):
-    """Send an Instagram DM by username (linked/admin only)."""
+    """Send an Instagram DM by username or direct thread URL (linked/admin only)."""
     if not _can_use_instagram_dm_discord(ctx.author.id):
         await ctx.reply("Only the linked user/admin can use Instagram DM automation.")
         return
     text = (args or "").strip()
     if not text:
-        await ctx.reply("Usage: `!ig_dm <username> [message]`")
+        await ctx.reply("Usage: `!ig_dm <username|instagram_direct_thread_url> [message]`")
         return
     parts = text.split(None, 1)
-    username = re.sub(r"^@", "", (parts[0] or "").strip())
+    target = (parts[0] or "").strip()
     custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
-    await ctx.reply(f"Opening Instagram and messaging @{username}...")
-    ok, result = await asyncio.to_thread(_run_instagram_dm_by_username, username, custom_message)
+    announce_target = target if _extract_instagram_thread_url(target) else f"@{re.sub(r'^@', '', target)}"
+    await ctx.reply(f"Opening Instagram and messaging {announce_target}...")
+    ok, result = await asyncio.to_thread(_run_instagram_dm, target, custom_message)
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
 
 
