@@ -1,5 +1,5 @@
 """
-Luna — Discord chatbot (Python) with Ollama (e.g. llama3.2, deepseek-r1).
+Luna — Discord chatbot (Python) with Ollama (e.g. qwen2.5-coder:7b-instruct).
 Responds when mentioned or in DMs. Add your token to .env and run: python bot.py
 
 Or pass token on command line: python bot.py YOUR_TOKEN
@@ -90,7 +90,7 @@ from local_music import create_local_song_project
 
 # Ollama defaults (override in .env: OLLAMA_BASE_URL, OLLAMA_MODEL)
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:latest")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b-instruct")
 
 LUNA_SYSTEM_PROMPT = """You are Luna, a friendly AI companion. You're warm, helpful, and a bit playful. Keep replies concise (a few sentences). Speak in first person as Luna.
 File access: Luna has access to the "Luna projects" folder. When the user asks you to create a website, game, or any file(s) and wants them saved there, you MUST save them via the system—do not only paste code in chat. For every file to save, add this exact block (one block per file). Put all blocks at the end of your reply with no other text after the last END_LUNA_WRITE.
@@ -143,7 +143,7 @@ else:
         DISCORD_TOKEN = DISCORD_TOKEN.split("\n")[0].split("\r")[0].strip()
 
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:latest")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b-instruct")
 # Discord: only this user ID can create/read/write/list/edit files. Others can chat only (no file execution).
 DISCORD_ADMIN_ID = (os.environ.get("DISCORD_ADMIN_ID") or "").strip()
 try:
