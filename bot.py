@@ -224,6 +224,15 @@ FACEBOOK_PROFILE_DIR = os.environ.get(
     "FACEBOOK_PROFILE_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "facebook_profile"),
 ).strip()
+# Facebook Messenger: open the chat window on Facebook.com (right-side panel) or use messenger.com
+MESSENGER_OPEN_ON_FACEBOOK = os.environ.get("MESSENGER_OPEN_ON_FACEBOOK", "true").strip().lower() in ("1", "true", "yes")
+MESSENGER_URL = (os.environ.get("MESSENGER_URL") or (FACEBOOK_HOME_URL if MESSENGER_OPEN_ON_FACEBOOK else "https://www.messenger.com")).strip().rstrip("/")
+MESSENGER_PROFILE_DIR = os.environ.get(
+    "MESSENGER_PROFILE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "messenger_profile"),
+).strip()
+MESSENGER_BROWSER_CHANNEL = (os.environ.get("MESSENGER_BROWSER_CHANNEL") or "chrome").strip().lower()
+MESSENGER_BROWSER_PATH = (os.environ.get("MESSENGER_BROWSER_PATH") or "").strip()
 _suno_bootstrap_lock = threading.Lock()
 _suno_bootstrap_running = False
 _suno_run_lock = threading.Lock()
@@ -245,6 +254,11 @@ _wa_web_bootstrap_running = False
 # Persist WhatsApp Web browser so the window stays open after !call / !msg
 _wa_web_context = None
 _wa_web_playwright = None
+_messenger_lock = threading.Lock()
+_messenger_bootstrap_lock = threading.Lock()
+_messenger_bootstrap_running = False
+_messenger_context = None
+_messenger_playwright = None
 
 
 def _collect_legacy_scopes_for_linked_user() -> list[str]:
@@ -3976,6 +3990,389 @@ def _run_whatsapp_web_msg(contact_name: str, description: str | None = None) -> 
     return _run_whatsapp_web_open_contact(contact_name, message_to_send=message)
 
 
+def _messenger_bootstrap_marker_path() -> str:
+    return os.path.join(MESSENGER_PROFILE_DIR, ".login_ready")
+
+
+def _is_messenger_bootstrap_done() -> bool:
+    return os.path.isfile(_messenger_bootstrap_marker_path())
+
+
+def _mark_messenger_bootstrap_done() -> None:
+    try:
+        os.makedirs(MESSENGER_PROFILE_DIR, exist_ok=True)
+        with open(_messenger_bootstrap_marker_path(), "w", encoding="utf-8") as f:
+            f.write("ready")
+    except Exception:
+        pass
+
+
+def _launch_messenger_context(playwright):
+    """Launch Playwright persistent context for Facebook Messenger (messenger.com)."""
+    opts = {
+        "user_data_dir": MESSENGER_PROFILE_DIR,
+        "headless": False,
+        "viewport": {"width": 1280, "height": 900},
+        "ignore_default_args": ["--enable-automation"],
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ],
+    }
+    if MESSENGER_BROWSER_PATH and os.path.isfile(MESSENGER_BROWSER_PATH):
+        opts["executable_path"] = MESSENGER_BROWSER_PATH
+    elif MESSENGER_BROWSER_CHANNEL in ("chrome", "msedge", "chrome-beta", "msedge-beta", "msedge-dev", "chromium"):
+        opts["channel"] = MESSENGER_BROWSER_CHANNEL
+    return playwright.chromium.launch_persistent_context(**opts)
+
+
+def _start_messenger_first_login_window() -> tuple[bool, str]:
+    """First-run: open Facebook (or Messenger) and keep browser open until user logs in."""
+    global _messenger_bootstrap_running
+    with _messenger_bootstrap_lock:
+        if _messenger_bootstrap_running:
+            return False, "Messenger login window is already open. Log in with Facebook, then close it and try again."
+        _messenger_bootstrap_running = True
+
+    url = FACEBOOK_HOME_URL if MESSENGER_OPEN_ON_FACEBOOK else MESSENGER_URL
+    def _run():
+        global _messenger_bootstrap_running
+        context = None
+        opened = False
+        try:
+            from playwright.sync_api import sync_playwright
+            os.makedirs(MESSENGER_PROFILE_DIR, exist_ok=True)
+            with sync_playwright() as p:
+                context = _launch_messenger_context(p)
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                opened = True
+                while True:
+                    try:
+                        if not context.pages:
+                            break
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        break
+        except Exception as e:
+            print(f"Messenger first-login error: {e}", flush=True)
+        finally:
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            if opened:
+                _mark_messenger_bootstrap_done()
+            with _messenger_bootstrap_lock:
+                _messenger_bootstrap_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True, (
+        "Opening Messenger. Log in with your Facebook account if prompted. "
+        "When you're in, close the browser window. Next time Luna will use this session for !fb_msg."
+    )
+
+
+def _default_messenger_message() -> str:
+    """Default message when user doesn't provide one (same style as WhatsApp)."""
+    return _default_whatsapp_message()
+
+
+def _get_or_create_messenger_context():
+    """Get existing Messenger browser context or create one. Window is left open (not closed)."""
+    global _messenger_context, _messenger_playwright
+    try:
+        if _messenger_context is not None:
+            try:
+                if _messenger_context.pages and not _messenger_context.pages[0].is_closed():
+                    return _messenger_context, _messenger_context.pages[0], False
+            except Exception:
+                pass
+            _messenger_context = None
+            _messenger_playwright = None
+    except Exception:
+        pass
+    from playwright.sync_api import sync_playwright
+    p = sync_playwright().start()
+    _messenger_playwright = p
+    os.makedirs(MESSENGER_PROFILE_DIR, exist_ok=True)
+    _messenger_context = _launch_messenger_context(p)
+    page = _messenger_context.pages[0] if _messenger_context.pages else _messenger_context.new_page()
+    return _messenger_context, page, True
+
+
+def _run_messenger_msg(username: str, message: str = "") -> tuple[bool, str]:
+    """Open Facebook (or Messenger), open the Messenger chat window for the user, send message. Keeps browser open."""
+    username = (username or "").strip()
+    if not username:
+        return False, "Please provide a Messenger contact (name or username)."
+    msg_text = (message or "").strip() or _default_messenger_message()
+    if not _messenger_lock.acquire(blocking=False):
+        return False, "Messenger automation is already running. Please wait and try again."
+    try:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return False, "Playwright is not installed. Run: pip install playwright && playwright install chromium"
+        if not _is_messenger_bootstrap_done():
+            _messenger_lock.release()
+            ok, out = _start_messenger_first_login_window()
+            return False, out + " Then run !fb_msg again."
+        context, page, is_new = _get_or_create_messenger_context()
+        if is_new:
+            page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4000)
+        else:
+            page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+        # Login required?
+        if "facebook.com" in page.url and ("login" in page.url.lower() or "checkpoint" in page.url.lower()):
+            _messenger_lock.release()
+            _start_messenger_first_login_window()
+            return False, "Facebook/Messenger session expired. Luna opened the login window — log in, then try !fb_msg again."
+        # On Facebook.com: go to the user's profile and click the "Message" button to open the chat (not search)
+        if "facebook.com" in page.url and MESSENGER_OPEN_ON_FACEBOOK:
+            # Username for URL: allow "antonia.constandinou" or "Antonia Constandinou" -> antonia.constandinou
+            profile_slug = username.replace(" ", ".").strip().lower()
+            if not re.match(r"^[a-z0-9._-]+$", profile_slug):
+                profile_slug = re.sub(r"[^a-zA-Z0-9._-]", "", username).replace(" ", ".")
+            profile_url = f"{FACEBOOK_HOME_URL.rstrip('/')}/{profile_slug}"
+            page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3500)
+            # Click the blue "Message" button on the profile (opens the right-side chat window)
+            message_btn = None
+            for sel in [
+                'a[href*="/messages/t/"]',
+                'span:has-text("Message")',
+                'div[aria-label="Message"]',
+                'button:has-text("Message")',
+                'a:has-text("Message")',
+                '[role="button"]:has-text("Message")',
+            ]:
+                try:
+                    btn = page.locator(sel).first
+                    if btn.count() and btn.is_visible():
+                        message_btn = btn
+                        break
+                except Exception:
+                    continue
+            if not message_btn or not message_btn.count():
+                return False, "Could not find the Message button on the profile. Check the username (e.g. antonia.constandinou)."
+            message_btn.click()
+            page.wait_for_timeout(3500)
+        else:
+            # messenger.com or fallback: search then open conversation
+            search_selectors = [
+                'input[placeholder*="Search"]',
+                'input[aria-label*="Search"]',
+                'div[role="search"] input',
+                'input[type="search"]',
+            ]
+            search_box = None
+            for sel in search_selectors:
+                loc = page.locator(sel).first
+                try:
+                    if loc.count() and loc.is_visible():
+                        search_box = loc
+                        break
+                except Exception:
+                    continue
+            if not search_box:
+                return False, "Could not find the search box. Try logging in again (close and run !fb_msg again)."
+            search_box.click()
+            page.wait_for_timeout(400)
+            search_box.fill("")
+            page.wait_for_timeout(200)
+            search_box.press_sequentially(username, delay=40)
+            page.wait_for_timeout(2800)
+            for sel in [
+                f'[role="listitem"]:has-text("{username}")',
+                f'a[href*="/messages"]:has-text("{username}")',
+                f'div[role="button"]:has-text("{username}")',
+                f'span:has-text("{username}")',
+            ]:
+                try:
+                    row = page.locator(sel).first
+                    if row.count() and row.is_visible():
+                        row.click()
+                        break
+                except Exception:
+                    continue
+            else:
+                try:
+                    page.get_by_text(username, exact=False).first.click()
+                except Exception:
+                    pass
+            page.wait_for_timeout(1500)
+        # Message input: the chat has a row of 4 icons; in the middle is the text box with "Aa" — type only there (never in profile post comments).
+        page.wait_for_timeout(1500)
+        msg_input = None
+        vw = page.viewport_size.get("width", 1000) if page.viewport_size else 1000
+        # 0) The chat message box is the one with "Aa" (middle of the input bar) — not profile comments
+        for aa_sel in [
+            '[data-placeholder*="Aa"]',
+            '[placeholder*="Aa" i]',
+            '[aria-placeholder*="Aa" i]',
+            'div[contenteditable="true"][data-lexical-editor="true"]',
+        ]:
+            try:
+                loc = page.locator(aa_sel).first
+                if loc.count() and loc.is_visible():
+                    box = loc.bounding_box()
+                    if box and box["x"] >= vw * 0.35:
+                        msg_input = loc
+                        break
+            except Exception:
+                continue
+        if not msg_input:
+            try:
+                aa_label = page.get_by_text("Aa", exact=True).first
+                if aa_label.count() and aa_label.is_visible():
+                    for candidate in [
+                        aa_label.locator('xpath=preceding-sibling::*[@contenteditable="true"][1]'),
+                        aa_label.locator('xpath=preceding-sibling::*[1]//*[@contenteditable="true"]'),
+                        aa_label.locator('xpath=preceding-sibling::*[1]'),
+                        aa_label.locator('xpath=following-sibling::*[@contenteditable="true"][1]'),
+                        aa_label.locator('..').locator('[contenteditable="true"]').first,
+                    ]:
+                        if not candidate.count() or not candidate.is_visible():
+                            continue
+                        el = candidate.first
+                        if el.get_attribute("contenteditable") == "true":
+                            box = el.bounding_box()
+                            if box and box["x"] >= vw * 0.35:
+                                msg_input = el
+                                break
+                    if not msg_input and aa_label.locator('..').locator('[contenteditable="true"]').count():
+                        msg_input = aa_label.locator('..').locator('[contenteditable="true"]').first
+            except Exception:
+                pass
+        # 1) Find by emoji icon (message box is left of "Choose an emoji")
+        for emoji_sel in ['[aria-label*="emoji" i]', '[aria-label*="Choose an emoji" i]', '[title*="emoji" i]']:
+            try:
+                parent = page.locator(emoji_sel).first
+                if parent.count() and parent.is_visible():
+                    candidate = parent.locator('xpath=preceding-sibling::*[1]').first
+                    if candidate.count() and candidate.is_visible() and candidate.get_attribute("contenteditable") == "true":
+                        msg_input = candidate
+                        break
+                    candidate = parent.locator('..').locator('div[contenteditable="true"]').first
+                    if candidate.count() and candidate.is_visible():
+                        msg_input = candidate
+                        break
+            except Exception:
+                continue
+        # 2) Role and common selectors (prefer right side of screen = chat panel)
+        if not msg_input:
+            for sel in [
+                'div[role="dialog"] div[contenteditable="true"][role="textbox"]',
+                'div[role="dialog"] div[contenteditable="true"]',
+                '[data-pagelet*="Messenger"] div[contenteditable="true"]',
+                'div[contenteditable="true"][role="textbox"]',
+                'div[contenteditable="true"][data-placeholder*="message"]',
+                'div[contenteditable="true"][data-placeholder*="Message"]',
+                'div[contenteditable="true"]',
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if not loc.count() or not loc.is_visible():
+                        continue
+                    box = loc.bounding_box()
+                    if box and box["x"] < vw * 0.45:
+                        continue
+                    msg_input = loc
+                    break
+                except Exception:
+                    continue
+        # 3) get_by_role("textbox") in case the message box has that role
+        if not msg_input:
+            try:
+                for role_loc in [page.get_by_role("textbox"), page.locator('[role="textbox"]')]:
+                    for i in range(role_loc.count()):
+                        loc = role_loc.nth(i)
+                        if loc.is_visible():
+                            box = loc.bounding_box()
+                            if box and box["x"] >= vw * 0.45:
+                                msg_input = loc
+                                break
+                    if msg_input:
+                        break
+            except Exception:
+                pass
+        # 4) JS fallback: mark the rightmost contenteditable in the right half of the viewport, then select it
+        if not msg_input:
+            try:
+                marked = page.evaluate("""() => {
+                    const vw = window.innerWidth;
+                    const edits = document.querySelectorAll('[contenteditable="true"]');
+                    let best = null;
+                    let maxX = vw * 0.35;
+                    for (const el of edits) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 20 || r.height < 15) continue;
+                        if (r.x >= maxX && r.x < vw - 40 && r.bottom > window.innerHeight * 0.5) {
+                            maxX = r.x;
+                            best = el;
+                        }
+                    }
+                    if (best) { best.setAttribute('data-luna-msgbox', '1'); return true; }
+                    return false;
+                }""")
+                if marked:
+                    msg_input = page.locator('[data-luna-msgbox="1"]').first
+            except Exception:
+                pass
+        # 5) Last resort: any contenteditable in the right 60% of the page
+        if not msg_input:
+            try:
+                all_edits = page.locator('div[contenteditable="true"]')
+                for i in range(min(all_edits.count(), 15)):
+                    loc = all_edits.nth(i)
+                    if not loc.is_visible():
+                        continue
+                    box = loc.bounding_box()
+                    if box and box["x"] >= vw * 0.35 and box["width"] > 50:
+                        msg_input = loc
+                        break
+            except Exception:
+                pass
+        if not msg_input:
+            return False, "Could not find the message box in the chat window (contenteditable). Make sure the Message button opened the chat."
+        # Focus the chat message box, clear it, type the message (no .fill() — use only contenteditable-friendly input)
+        msg_input.click()
+        page.wait_for_timeout(400)
+        # Clear any existing text: Ctrl+A then Backspace (works in contenteditable)
+        page.keyboard.press("Control+a")
+        page.wait_for_timeout(50)
+        page.keyboard.press("Backspace")
+        page.wait_for_timeout(150)
+        # Type the message so the user sees it being written; keep window open until sent
+        msg_input.press_sequentially(msg_text, delay=35)
+        page.wait_for_timeout(500)
+        # Send with Enter (as requested)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(800)
+        # Leave the browser window open (do not close context in finally)
+        return True, f"Opened the Messenger chat with **{username}** and sent: \"{msg_text[:50]}{'…' if len(msg_text) > 50 else ''}\". Window left open."
+    except Exception as e:
+        err = (str(e) or "unknown")[:200]
+        return False, f"Messenger error: {err}"
+    finally:
+        try:
+            _messenger_lock.release()
+        except Exception:
+            pass
+        # Do not close the browser — keep the window open so the user sees the message written and sent
+
+
 def _can_use_whatsapp_discord(author_id: int) -> bool:
     """Allow WhatsApp call/msg automation on Discord only for linked user or admin."""
     if _discord_admin_id_int is not None and author_id == _discord_admin_id_int:
@@ -3983,6 +4380,11 @@ def _can_use_whatsapp_discord(author_id: int) -> bool:
     if _linked_discord_id_int is not None and author_id == _linked_discord_id_int:
         return True
     return False
+
+
+def _can_use_messenger_discord(author_id: int) -> bool:
+    """Allow Messenger automation on Discord only for linked user or admin."""
+    return _can_use_whatsapp_discord(author_id)
 
 
 def _stream_tts_chunks(text: str):
@@ -4217,12 +4619,181 @@ LUNA_COMMANDS_REPLY = (
     "• !share_facebook (or !share facebook) — share to Facebook\n"
     "• !yt_comment <youtube_url> — transcribe and post a YouTube comment\n"
     "• !ig_dm <username|thread_url> [message] — send an Instagram DM\n"
+    "• !fb_msg <username or name> [message] — send a Facebook Messenger message\n"
     "• !remember / !always_remember — store memories\n"
     "• !profile — view or set your profile\n"
     "• !join / !leave — voice; !play / !pause / !skip / !stop / !queue — music\n"
     "• !call <contact> — WhatsApp Web: open chat with contact (voice calls need desktop app)\n"
     "• !msg <contact> [description] — WhatsApp Web: open chat and send message (default or your text, from Luna)"
 )
+
+# Natural language command parsing: system prompt for Ollama to map user message → command + params
+_NL_COMMAND_SYSTEM = """You are a strict command classifier for Luna (an AI assistant). The user will say something in natural language. Decide if they are asking Luna to perform ONE of these actions. If yes, reply with ONLY a single JSON object, no other text. If no, reply with exactly: {"command": null}
+
+Commands and their JSON shape (use these keys only):
+- Send a WhatsApp message to someone: {"command": "msg", "contact": "<name or number>", "description": "<optional context for message content>"}
+- Open WhatsApp chat / call someone: {"command": "call", "contact": "<name or number>"}
+- Get latest news / headlines: {"command": "news"}
+- Play music on Discord (e.g. play X, play a song): {"command": "play", "query": "<song name or empty>"}
+- Create a song on Suno: {"command": "suno", "description": "<song idea>"}
+- Generate a local song (instrumental + lyrics): {"command": "local_song", "description": "<song idea>"}
+- Share a song to X/Twitter: {"command": "share_x"}
+- Share a song to Facebook: {"command": "share_facebook"}
+- Comment on a YouTube video: {"command": "yt_comment", "video_url": "<url>"}
+- Send an Instagram DM: {"command": "ig_dm", "target": "<username or thread url>", "message": "<optional text>"}
+- Send a Facebook Messenger message: {"command": "fb_msg", "target": "<name or username>", "message": "<optional text>"}
+- Read a file in Luna projects: {"command": "read", "path": "<path>"}
+- List files in Luna projects: {"command": "list", "path": "<optional path>"}
+- Write content to a file in Luna projects: {"command": "write", "path": "<path>", "content": "<text>"}
+- Show commands / help / what can you do: {"command": "files"}
+- Join voice channel: {"command": "join"}
+- Leave voice: {"command": "leave"}
+- Pause / resume / skip / stop music, show queue: {"command": "pause"}, {"command": "resume"}, {"command": "skip"}, {"command": "stop"}, {"command": "queue"}
+
+Rules: Output ONLY valid JSON. Omit optional params if not mentioned. For "msg", description is optional (context for the message). For "play", query can be empty string if they just say "play" or "resume". If the user is just chatting, asking a question, or not clearly requesting one action above, reply {"command": null}."""
+
+
+def _parse_natural_language_command(msg: str) -> tuple[str, dict] | None:
+    """If the user message is a natural-language request for a Luna command, return (command_key, params). Else return None."""
+    msg = (msg or "").strip()
+    if not msg or msg.startswith("!"):
+        return None
+    try:
+        raw = ollama_chat(msg, system_prompt=_NL_COMMAND_SYSTEM, memory_scope=None, message_history=None)
+        raw = (raw or "").strip()
+        if not raw or "command" not in raw:
+            return None
+        # Extract JSON (model might wrap in markdown or add text)
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start < 0 or end <= start:
+            return None
+        obj = json.loads(raw[start:end])
+        cmd = obj.get("command")
+        if cmd is None or (isinstance(cmd, str) and cmd.lower() in ("none", "null", "")):
+            return None
+        cmd = str(cmd).strip().lower()
+        if not cmd:
+            return None
+        params = {k: v for k, v in obj.items() if k != "command" and v is not None and (not isinstance(v, str) or v.strip())}
+        if isinstance(params.get("path"), str):
+            params["path"] = params["path"].strip()
+        if isinstance(params.get("query"), str):
+            params["query"] = params["query"].strip()
+        return (cmd, params)
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def _run_parsed_command(cmd: str, params: dict) -> str:
+    """Execute a parsed command (from NL or internal) and return the reply text."""
+    cmd = (cmd or "").strip().lower()
+    p = params or {}
+    if cmd == "msg":
+        contact = (p.get("contact") or "").strip()
+        desc = (p.get("description") or "").strip() or None
+        if not contact:
+            return "Who should I message? Say the contact name (e.g. message Marios)."
+        ok, result = _run_whatsapp_web_msg(contact, desc)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "call":
+        contact = (p.get("contact") or "").strip()
+        if not contact:
+            return "Who should I call? Say the contact name."
+        ok, result = _run_whatsapp_web_call(contact)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "news":
+        ok, result = _fetch_world_news()
+        return result if ok else f"❌ {result}"
+    if cmd == "play":
+        return "Use !play <song or url> in Discord when I'm in a voice channel to play music."
+    if cmd == "suno":
+        desc = (p.get("description") or "").strip()
+        if not desc:
+            return "What kind of song? Give a short description."
+        ok, result = _run_suno_create(desc)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "local_song":
+        desc = (p.get("description") or "").strip()
+        if not desc:
+            return "What kind of song? Give a short description."
+        ok, result = create_local_song_project(desc)
+        return f"✅ Local song package created:\n{result}" if ok else f"❌ {result}"
+    if cmd == "share_x":
+        ok, result = _run_x_share_random_song()
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "share_facebook":
+        ok, result = _run_facebook_share_random_song()
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "yt_comment":
+        url = (p.get("video_url") or "").strip()
+        if not url:
+            return "Which YouTube video? Paste the link."
+        url = _extract_youtube_video_url(url) or url
+        ok, result = _run_youtube_comment(url)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "ig_dm":
+        target = (p.get("target") or "").strip()
+        msg_text = (p.get("message") or "").strip() or ""
+        if not target:
+            return "Who should I message on Instagram? Give a username or thread link."
+        ok, result = _run_instagram_dm(target, msg_text)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "fb_msg":
+        target = (p.get("target") or "").strip()
+        msg_text = (p.get("message") or "").strip() or ""
+        if not target:
+            return "Who should I message on Messenger? Give a name or username."
+        ok, result = _run_messenger_msg(target, msg_text)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "read":
+        path = (p.get("path") or "").strip()
+        if not path:
+            return "Which file? Say the path (e.g. read myfile.txt)."
+        ok, result = luna_read_file(path)
+        if ok:
+            return f"```\n{result}\n```" if len(result) <= 1900 else result[:1897] + "..."
+        return f"❌ {result}"
+    if cmd == "list":
+        path = (p.get("path") or "").strip()
+        ok, result = luna_list_dir(path)
+        if ok:
+            return f"Luna projects / {path or '.'}\n```\n{result}\n```"
+        return f"❌ {result}"
+    if cmd == "write":
+        path = (p.get("path") or "").strip()
+        content = (p.get("content") or "").strip()
+        if not path:
+            return "Which file? Say the path (e.g. write myfile.txt with content hello)."
+        ok, result = luna_write_file(path, content)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "files":
+        return LUNA_COMMANDS_REPLY
+    if cmd == "join":
+        return "Use !join in a Discord server where I'm in the voice channel list."
+    if cmd in ("leave", "pause", "resume", "skip", "stop", "queue"):
+        return f"Use !{cmd} in Discord when I'm in a voice channel."
+    return ""
+
+
+def _is_nl_command_allowed_on_discord(cmd: str, author_id: int) -> bool:
+    """True if this Discord user can run this command (admin/linked where required)."""
+    if cmd in ("msg", "call"):
+        return _can_use_whatsapp_discord(author_id)
+    if cmd == "suno":
+        return _can_use_suno_discord(author_id)
+    if cmd in ("share_x", "share_facebook"):
+        return _can_use_x_share_discord(author_id)
+    if cmd == "yt_comment":
+        return _can_use_youtube_comment_discord(author_id)
+    if cmd == "ig_dm":
+        return _can_use_instagram_dm_discord(author_id)
+    if cmd == "fb_msg":
+        return _can_use_messenger_discord(author_id)
+    if cmd in ("read", "list", "write", "edit"):
+        return _discord_admin_id_int is not None and author_id == _discord_admin_id_int
+    return True
+
 
 # Trigger phrases for command/help intent (natural language → template reply)
 _COMMAND_INTENT_TRIGGERS = (
@@ -4358,6 +4929,14 @@ def _handle_web_file_command(msg: str) -> str | None:
         custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
         ok, result = _run_instagram_dm(target, custom_message)
         return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd in ("!fb_msg", "!messenger", "!fbmsg"):
+        if not args:
+            return "Usage: !fb_msg <username or name> [message] (e.g. !fb_msg John or !fb_msg John have a great day)"
+        parts = args.split(None, 1)
+        target = (parts[0] or "").strip()
+        custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
+        ok, result = _run_messenger_msg(target, custom_message)
+        return f"✅ {result}" if ok else f"❌ {result}"
     if cmd == "!call":
         if not args:
             return "Usage: !call <contact name or number> (e.g. !call Marios or !call +357 96 724268)"
@@ -4419,11 +4998,21 @@ def api_chat():
         reply = "Cancelled."
         append_exchange(scope, msg, reply)
         return jsonify({"reply": reply})
-    # Explicit local commands in browser always execute directly.
+    # Explicit ! commands in browser always execute directly.
     file_reply = _handle_web_file_command(msg)
     if file_reply is not None:
         append_exchange(scope, msg, file_reply)
         return jsonify({"reply": file_reply})
+    # Natural language: map plain text to a command and run it (e.g. "message Marios goodnight" -> msg)
+    if not msg.strip().startswith("!"):
+        parsed = _parse_natural_language_command(msg)
+        if parsed:
+            cmd_key, cmd_params = parsed
+            reply = _run_parsed_command(cmd_key, cmd_params)
+            if reply:
+                append_exchange(scope, msg, reply)
+                _play_reply_tts_on_pc(reply)
+                return jsonify({"reply": reply})
     if _extract_news_request(msg):
         ok, result = _fetch_world_news()
         reply = result if ok else f"❌ {result}"
@@ -4652,6 +5241,22 @@ async def on_message(message: discord.Message):
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
+        # Natural language: map plain text to a command (e.g. "message Marios goodnight" -> msg)
+        if not text.strip().startswith("!"):
+            parsed = await asyncio.to_thread(_parse_natural_language_command, text)
+            if parsed:
+                cmd_key, cmd_params = parsed
+                if _is_nl_command_allowed_on_discord(cmd_key, message.author.id):
+                    reply = await asyncio.to_thread(_run_parsed_command, cmd_key, cmd_params)
+                    if reply:
+                        await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                        await message.reply(f"{mention} {reply}")
+                        return
+                else:
+                    reply = "You don't have permission to use that command here."
+                    await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                    await message.reply(f"{mention} {reply}")
+                    return
         if _extract_news_request(text):
             ok, result = await asyncio.to_thread(_fetch_world_news)
             reply = result if ok else f"❌ {result}"
@@ -4969,6 +5574,24 @@ async def cmd_ig_dm(ctx: commands.Context, *, args: str = ""):
     announce_target = target if _extract_instagram_thread_url(target) else f"@{re.sub(r'^@', '', target)}"
     await ctx.reply(f"Opening Instagram and messaging {announce_target}...")
     ok, result = await asyncio.to_thread(_run_instagram_dm, target, custom_message)
+    await ctx.reply(f"{'✅' if ok else '❌'} {result}")
+
+
+@bot.command(name="fb_msg", aliases=["messenger", "fbmsg"])
+async def cmd_fb_msg(ctx: commands.Context, *, args: str = ""):
+    """Send a Facebook Messenger message by name or username (linked/admin only). Usage: !fb_msg <username> [message]"""
+    if not _can_use_messenger_discord(ctx.author.id):
+        await ctx.reply("Only the linked user/admin can use Messenger automation.")
+        return
+    text = (args or "").strip()
+    if not text:
+        await ctx.reply("Usage: `!fb_msg <username or name> [message]` (e.g. !fb_msg John or !fb_msg John have a great day)")
+        return
+    parts = text.split(None, 1)
+    target = (parts[0] or "").strip()
+    custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
+    await ctx.reply(f"Opening Messenger and sending a message to **{target}**...")
+    ok, result = await asyncio.to_thread(_run_messenger_msg, target, custom_message)
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
 
 
