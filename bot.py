@@ -3803,8 +3803,53 @@ def _get_or_create_wa_web_context():
     return _wa_web_context, page, True
 
 
-def _run_whatsapp_web_open_contact(contact_name: str) -> tuple[bool, str]:
-    """Open WhatsApp Web, ensure logged in, search for contact, open chat. Leaves browser window open."""
+def _generate_whatsapp_message_from_context(description: str) -> str:
+    """Use the description as context and generate a short WhatsApp message (e.g. friendly, signed from Luna)."""
+    system = (
+        "You are Luna, a friendly assistant. The user will give you a brief context or topic. "
+        "Reply with exactly one short WhatsApp-style message (1-2 sentences, friendly and natural). "
+        "The message should be inspired by the context, not a literal repeat. End with 'from Luna' or '- from Luna'. "
+        "Output only the message text, no quotes, no explanation."
+    )
+    try:
+        out = ollama_chat(description.strip(), system_prompt=system, memory_scope=None, message_history=None)
+        out = (out or "").strip()
+        if out and len(out) < 500 and ("luna" in out.lower() or "from" in out.lower()):
+            return out
+        if out and len(out) < 500:
+            return out + " - from Luna"
+    except Exception:
+        pass
+    return (description.strip() + " - from Luna").strip()
+
+
+def _parse_whatsapp_msg_args(args: str) -> tuple[str, str | None]:
+    """Split '!msg' arguments into contact name and optional description. E.g. 'Marios goodnight' -> ('Marios', 'goodnight')."""
+    s = (args or "").strip()
+    if not s:
+        return "", None
+    parts = s.split(None, 1)
+    contact = parts[0] or ""
+    description = (parts[1].strip() or None) if len(parts) > 1 else None
+    return contact, description
+
+
+def _default_whatsapp_message() -> str:
+    """Return a default message when user doesn't provide a description (time-based or friendly)."""
+    hour = time.localtime().tm_hour
+    if 5 <= hour < 12:
+        return "Have a wonderful day from Luna"
+    if 12 <= hour < 17:
+        return "Hope you're having a great day - from Luna"
+    if 17 <= hour < 21:
+        return "Have a lovely evening from Luna"
+    if hour >= 21 or hour < 5:
+        return "Goodnight from Luna"
+    return "Have a wonderful day from Luna"
+
+
+def _run_whatsapp_web_open_contact(contact_name: str, message_to_send: str | None = None) -> tuple[bool, str]:
+    """Open WhatsApp Web, ensure logged in, search for contact, open chat. Optionally type and send a message. Leaves browser window open."""
     contact_name = (contact_name or "").strip()
     if not contact_name:
         return False, "Please provide a contact name (e.g. !msg Marios)."
@@ -3872,6 +3917,42 @@ def _run_whatsapp_web_open_contact(contact_name: str) -> tuple[bool, str]:
                 except Exception:
                     pass
             page.wait_for_timeout(800)
+            if message_to_send:
+                try:
+                    msg_input_selectors = [
+                        'div[contenteditable="true"][role="textbox"]',
+                        'footer [contenteditable="true"]',
+                        '[data-tab="10"]',
+                        'div[contenteditable="true"].selectable-text',
+                    ]
+                    msg_input = None
+                    for sel in msg_input_selectors:
+                        loc = page.locator(sel).first
+                        try:
+                            if loc.count() and loc.is_visible():
+                                msg_input = loc
+                                break
+                        except Exception:
+                            continue
+                    if msg_input:
+                        msg_input.click()
+                        page.wait_for_timeout(300)
+                        msg_input.fill("")
+                        page.wait_for_timeout(100)
+                        msg_input.press_sequentially(message_to_send, delay=30)
+                        page.wait_for_timeout(400)
+                        send_btn = page.locator('[data-testid="send"]').first
+                        if not send_btn.count() or not send_btn.is_visible():
+                            send_btn = page.locator('[data-icon="send"]').first
+                        if send_btn.count() and send_btn.is_visible():
+                            send_btn.click()
+                        else:
+                            page.keyboard.press("Enter")
+                        page.wait_for_timeout(500)
+                        return True, f"Sent to **{contact_name}**: \"{message_to_send[:50]}{'…' if len(message_to_send) > 50 else ''}\". Window left open."
+                except Exception:
+                    pass
+                return True, f"Opened chat with **{contact_name}** but couldn't send the message. Window left open."
             return True, f"Opened chat with **{contact_name}**. Window left open."
         except Exception as e:
             err = (str(e) or "unknown")[:200]
@@ -3886,9 +3967,13 @@ def _run_whatsapp_web_call(contact_name: str) -> tuple[bool, str]:
     return True, f"Opened chat with **{contact_name}**. Voice calls need the WhatsApp desktop app — use it from there. Window left open."
 
 
-def _run_whatsapp_web_msg(contact_name: str) -> tuple[bool, str]:
-    """Open WhatsApp Web and open chat with contact (ready to type)."""
-    return _run_whatsapp_web_open_contact(contact_name)
+def _run_whatsapp_web_msg(contact_name: str, description: str | None = None) -> tuple[bool, str]:
+    """Open WhatsApp Web, open chat with contact, and send a message. If no description, send a default (e.g. 'Have a wonderful day from Luna'). If description is given, use it as context to generate the message (not word-for-word)."""
+    if description is not None and description.strip():
+        message = _generate_whatsapp_message_from_context(description)
+    else:
+        message = _default_whatsapp_message()
+    return _run_whatsapp_web_open_contact(contact_name, message_to_send=message)
 
 
 def _can_use_whatsapp_discord(author_id: int) -> bool:
@@ -4136,7 +4221,7 @@ LUNA_COMMANDS_REPLY = (
     "• !profile — view or set your profile\n"
     "• !join / !leave — voice; !play / !pause / !skip / !stop / !queue — music\n"
     "• !call <contact> — WhatsApp Web: open chat with contact (voice calls need desktop app)\n"
-    "• !msg <contact> — WhatsApp Web: open chat with contact"
+    "• !msg <contact> [description] — WhatsApp Web: open chat and send message (default or your text, from Luna)"
 )
 
 # Trigger phrases for command/help intent (natural language → template reply)
@@ -4280,8 +4365,11 @@ def _handle_web_file_command(msg: str) -> str | None:
         return f"✅ {result}" if ok else f"❌ {result}"
     if cmd == "!msg":
         if not args:
-            return "Usage: !msg <contact name or number>"
-        ok, result = _run_whatsapp_web_msg(args)
+            return "Usage: !msg <contact> [description] (e.g. !msg Marios or !msg Marios goodnight)"
+        contact_name, description = _parse_whatsapp_msg_args(args)
+        if not contact_name:
+            return "Usage: !msg <contact> [description]"
+        ok, result = _run_whatsapp_web_msg(contact_name, description)
         return f"✅ {result}" if ok else f"❌ {result}"
     return None
 
@@ -5257,17 +5345,21 @@ async def cmd_whatsapp_call(ctx: commands.Context, *, contact: str = ""):
 
 
 @bot.command(name="msg")
-async def cmd_whatsapp_msg(ctx: commands.Context, *, contact: str = ""):
-    """Open WhatsApp Web and open chat with contact. Usage: !msg <contact name>"""
+async def cmd_whatsapp_msg(ctx: commands.Context, *, args: str = ""):
+    """Open WhatsApp Web, open chat with contact, and send a message. Usage: !msg <contact> [description]"""
     if not _can_use_whatsapp_discord(ctx.author.id):
         await ctx.reply("Only the linked user or admin can use WhatsApp automation.")
         return
-    contact = (contact or "").strip()
-    if not contact:
-        await ctx.reply("Usage: `!msg <contact name>` (e.g. !msg Marios)")
+    args = (args or "").strip()
+    if not args:
+        await ctx.reply("Usage: `!msg <contact> [description]` (e.g. !msg Marios or !msg Marios goodnight)")
         return
-    await ctx.reply(f"Opening WhatsApp and chat with **{contact}**…")
-    ok, result = await asyncio.to_thread(_run_whatsapp_web_msg, contact)
+    contact_name, description = _parse_whatsapp_msg_args(args)
+    if not contact_name:
+        await ctx.reply("Usage: `!msg <contact> [description]`")
+        return
+    await ctx.reply(f"Opening WhatsApp and sending message to **{contact_name}**…")
+    ok, result = await asyncio.to_thread(_run_whatsapp_web_msg, contact_name, description)
     await ctx.reply(result if ok else f"❌ {result}")
 
 
