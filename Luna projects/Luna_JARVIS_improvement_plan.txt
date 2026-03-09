@@ -1,0 +1,61 @@
+LUNA — JARVIS-INSPIRED IMPROVEMENT PLAN
+(Ranked by importance / impact vs effort)
+==========================================
+
+Source: Ideas from "From Siri to JARVIS" (omnida.substack.com) applied to Luna.
+
+
+TIER 1 — DO FIRST (high impact, low–medium effort)
+--------------------------------------------------
+
+1. ONE-SHOT "CREATE AND SAVE"
+   - Reduce friction: "Create a game" → Luna generates, asks once, then saves and opens in Notepad.
+   - Biggest UX win with minimal new systems.
+
+2. EXPLICIT "OBJECTIVES AND CONSTRAINTS"
+   - User-defined rules (e.g. "always save code in Luna projects", "ask before sharing").
+   - Gives a clear "what Luna is allowed to do" layer and makes trust and behavior predictable.
+
+3. SIMPLE ACTION LOG (AUDIT TRAIL)
+   - Log file creates, shares, etc. in data/ or Luna projects.
+   - Builds trust ("what did Luna do?") and helps debugging; no change to Luna's personality.
+
+
+TIER 2 — DO NEXT (strong "JARVIS-like" feel)
+--------------------------------------------
+
+4. STYLE / PREFERENCE ALIGNMENT
+   - Store a few user prefs (reply length, tone, when to use TTS) and feed them into the system prompt.
+   - Makes Luna feel more "tuned to you" without new features.
+
+5. GOAL-AWARE MEMORY
+   - Tag some memories as goals (e.g. "finish the Discord game") and have Luna reference them.
+   - Builds continuity and intent.
+
+6. ANTICIPATE INTENT
+   - Use profile + recent memory to infer context and suggest next steps or offer to create/save files.
+   - Makes Luna feel more proactive.
+
+
+TIER 3 — LATER (higher effort or dependency)
+--------------------------------------------
+
+7. PROACTIVE NUDGES
+   - Optional "you might want to…" or "last time you were…" at session start.
+   - Needs goal-aware memory and possibly scheduling.
+
+8. RICHER "WHAT LUNA CAN DO" UI
+   - A small "Luna's permissions" or "what I'm allowed to do" view (web/Discord).
+   - Good once objectives/constraints and audit log exist.
+
+
+SUGGESTED IMPLEMENTATION ORDER
+------------------------------
+1. One-shot create and save       (Tier 1, #1)
+2. Objectives and constraints     (Tier 1, #2)
+3. Action log                     (Tier 1, #3)
+4. Style/preference alignment     (Tier 2, #4)
+5. Goal-aware memory              (Tier 2, #5)
+6. Anticipate intent              (Tier 2, #6)
+7. Proactive nudges               (Tier 3, #7)
+8. Permissions / "what Luna can do" UI  (Tier 3, #8)

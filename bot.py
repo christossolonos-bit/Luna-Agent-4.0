@@ -24,6 +24,8 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from collections import deque
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import discord
 from discord.ext import commands
@@ -31,7 +33,6 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 
 from luna_files import (
-    ALLOWED_BASE,
     safe_path as luna_safe_path,
     read_file as luna_read_file,
     write_file as luna_write_file,
@@ -49,12 +50,12 @@ def _open_file_in_editor(relative_path: str) -> bool:
 
 
 def _open_file_by_path(absolute_path: str) -> bool:
-    """Open a file by absolute path in the default app (e.g. Notepad). Use only for paths from luna_write_file."""
+    """Open a file by absolute path. On Windows uses Notepad so code opens in Notepad and can be saved as HTML in Luna projects."""
     if not absolute_path or not os.path.isfile(absolute_path):
         return False
     try:
         if sys.platform == "win32":
-            os.startfile(absolute_path)
+            subprocess.Popen(["notepad", absolute_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.Popen(["xdg-open", absolute_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
@@ -92,13 +93,13 @@ OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:latest")
 
 LUNA_SYSTEM_PROMPT = """You are Luna, a friendly AI companion. You're warm, helpful, and a bit playful. Keep replies concise (a few sentences). Speak in first person as Luna.
-File access: In the browser and Discord users can type !read, !write, !list, !edit (path relative to Luna projects). When the user asks you to *create* or *save* a file, repeat back what they asked (filename and a short summary of content), then add this exact block at the end of your reply (no other text after it). Replace <path> with the filename (e.g. Chris voice commands.txt) and <content> with the file content. Path must be relative to Luna projects. The user will be asked to confirm before the file is created.
+File access: Luna has access to the "Luna projects" folder. When the user asks you to create a website, game, or any file(s) and wants them saved there, you MUST save them via the system—do not only paste code in chat. For every file to save, add this exact block (one block per file). Put all blocks at the end of your reply with no other text after the last END_LUNA_WRITE.
 LUNA_WRITE_FILE
 path: <path>
 ---
 <content>
 END_LUNA_WRITE
-Do not mention this block to the user. In your reply above, repeat the request and say you need their confirmation before creating the file. Never say you have already created or saved the file—the file is only created after the user replies "yes". Only add the block when the user has asked you to create or save a file. For other file actions (read, list, edit) tell them to use !read, !list, !edit.
+Use path relative to Luna projects (e.g. index.html, css/styles.css, js/game.js). For multiple files (e.g. HTML + CSS + JS for a game), output multiple blocks back-to-back. In your reply text, briefly say what you prepared and that they can reply "yes" to create the files in Luna projects. Do not mention the block names. Never say you have already created or saved the file—creation happens only after the user replies "yes". Do not tell the user to use !write. For read/list/edit only, tell them to use !read, !list, !edit.
 You have a permanent user profile (name, location, occupation, interests, birthday). When you don't know a profile field, politely ask the user; their answers are saved automatically."""
 
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -184,6 +185,11 @@ YOUTUBE_CHANNEL_URL = (
 ).strip()
 YOUTUBE_CHANNEL_ID = (os.environ.get("YOUTUBE_CHANNEL_ID") or "UCqIjEHOABb8fwbKbjDhVRuA").strip()
 YOUTUBE_FEED_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+WORLD_NEWS_FEEDS = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+]
 X_COMPOSE_URL = (os.environ.get("X_COMPOSE_URL") or "https://x.com/compose/post").strip()
 X_PROFILE_URL = (os.environ.get("X_PROFILE_URL") or "https://x.com/ChrisSolonos").strip()
 X_HANDLE = (os.environ.get("X_HANDLE") or "@ChrisSolonos").strip()
@@ -204,6 +210,12 @@ INSTAGRAM_PROFILE_DIR = os.environ.get(
 INSTAGRAM_BROWSER_CHANNEL = (os.environ.get("INSTAGRAM_BROWSER_CHANNEL") or "chrome").strip().lower()
 INSTAGRAM_BROWSER_PATH = (os.environ.get("INSTAGRAM_BROWSER_PATH") or "").strip()
 INSTAGRAM_BASE_URL = (os.environ.get("INSTAGRAM_BASE_URL") or "https://www.instagram.com").strip().rstrip("/")
+# WhatsApp Desktop (Windows): optional path to WhatsApp.exe; default %LOCALAPPDATA%\WhatsApp\WhatsApp.exe
+if sys.platform == "win32":
+    _whatsapp_default_path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "WhatsApp", "WhatsApp.exe")
+else:
+    _whatsapp_default_path = ""
+WHATSAPP_APP_PATH = (os.environ.get("WHATSAPP_APP_PATH") or _whatsapp_default_path).strip()
 FACEBOOK_PROFILE_URL = (os.environ.get("FACEBOOK_PROFILE_URL") or "https://www.facebook.com/solonaras").strip()
 FACEBOOK_HOME_URL = (os.environ.get("FACEBOOK_HOME_URL") or "https://www.facebook.com/").strip()
 FACEBOOK_PROFILE_DIR = os.environ.get(
@@ -674,7 +686,8 @@ def _build_system_prompt(base: str | None, memory_scope: str | None) -> str | No
     if LINKED_SCOPE and memory_scope == LINKED_SCOPE:
         parts.append(
             "The current user is Chris (Solonaras). They use both the web UI and Discord—treat them as the same person. "
-            "Remember them and continue conversations naturally on either platform."
+            "Remember them and continue conversations naturally on either platform. "
+            "When they ask for a game, website, or any code to be saved in Luna projects, you must add LUNA_WRITE_FILE blocks (one per file) so the files are created there—do not only show code in the chat."
         )
     elif memory_scope.startswith("discord"):
         parts.append(
@@ -870,27 +883,70 @@ async def _get_tts_for_discord(text: str) -> bytes | None:
     return await asyncio.to_thread(_generate_tts, text)
 
 
+# TTS stop: set by /api/tts-stop or before next chunk; current ffplay process for web PC playback
+_tts_stop_requested = False
+_tts_current_process: subprocess.Popen | None = None
+_tts_lock = threading.Lock()
+
+
+def _stop_tts_on_pc() -> None:
+    """Stop any currently playing TTS on the PC (web). Idempotent."""
+    global _tts_stop_requested, _tts_current_process
+    with _tts_lock:
+        _tts_stop_requested = True
+        p = _tts_current_process
+        _tts_current_process = None
+    if p is not None and p.poll() is None:
+        try:
+            p.terminate()
+            p.wait(timeout=2)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
 def _play_tts_on_pc(audio_mp3_bytes: bytes) -> None:
-    """Play TTS audio on this PC (server) using ffplay. No-op if ffplay not available or on error."""
+    """Play TTS audio on this PC (server) using ffplay. Respects _tts_stop_requested."""
+    global _tts_current_process
     if not audio_mp3_bytes:
         return
     fd, path = tempfile.mkstemp(suffix=".mp3")
+    proc = None
     try:
         os.write(fd, audio_mp3_bytes)
         os.close(fd)
         fd = None
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-        subprocess.run(
+        proc = subprocess.Popen(
             ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", path],
-            capture_output=True,
-            timeout=120,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             creationflags=creationflags,
         )
+        with _tts_lock:
+            _tts_current_process = proc
+        while proc.poll() is None:
+            if _tts_stop_requested:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                break
+            time.sleep(0.2)
     except FileNotFoundError:
         pass  # ffplay not in PATH
     except Exception:
         pass
     finally:
+        with _tts_lock:
+            if _tts_current_process is proc:
+                _tts_current_process = None
         if fd is not None:
             try:
                 os.close(fd)
@@ -902,14 +958,47 @@ def _play_tts_on_pc(audio_mp3_bytes: bytes) -> None:
             pass
 
 
+def _reply_text_for_tts(reply: str) -> str:
+    """Strip code, HTML, and write-block lines so TTS speaks only context, not code."""
+    if not (reply or reply.strip()):
+        return ""
+    text = reply
+    # Remove full LUNA_WRITE_FILE ... END_LUNA_WRITE blocks
+    text = re.sub(r"LUNA_WRITE_FILE.*?END_LUNA_WRITE", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Remove markdown code blocks (```lang\n...\n``` or ```\n...\n```)
+    text = re.sub(r"```[\w]*\n.*?```", "", text, flags=re.DOTALL)
+    # Remove standalone LUNA_WRITE_FILE / path: lines (artifact when block is partial)
+    text = re.sub(r"(?m)^.*LUNA_WRITE_FILE.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?m)^\s*path:\s*\S+.*$", "", text)
+    # Remove inline code (single backticks)
+    text = re.sub(r"`[^`]*`", " ", text)
+    # Remove HTML tags and their content (optional: only strip tags, keep text inside)
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Strip Discord mentions and bold
+    text = re.sub(r"<@!?\d+>", "", text)
+    text = re.sub(r"\*\*", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def _play_reply_tts_on_pc(reply: str) -> None:
     """Generate TTS for reply and play on this PC in chunks (streaming feel). Runs in background."""
+    global _tts_stop_requested
+    tts_text = _reply_text_for_tts(reply)
+    if not tts_text.strip():
+        return  # Nothing to speak (e.g. only code)
     def _run():
+        global _tts_stop_requested
         try:
-            for chunk_text in _split_into_chunks(reply):
+            _tts_stop_requested = False
+            for chunk_text in _split_into_chunks(tts_text):
+                if _tts_stop_requested:
+                    break
                 if not chunk_text.strip():
                     continue
                 audio = _generate_tts(chunk_text)
+                if _tts_stop_requested:
+                    break
                 if audio:
                     _play_tts_on_pc(audio)
         except Exception:
@@ -1148,6 +1237,145 @@ def _extract_instagram_thread_url(text: str) -> str:
     if not m:
         return ""
     return (m.group(1) or "").strip().rstrip(".,!?")
+
+
+def _extract_news_request(text: str) -> bool:
+    """Return True when user asks for latest/today/world news headlines."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    low = raw.lower()
+    if low.startswith("!news"):
+        return True
+    patterns = (
+        r"\bwhat(?:'s| is)\s+the\s+news\b",
+        r"\bnews\s+for\s+today\b",
+        r"\btoday(?:'s)?\s+news\b",
+        r"\blatest\s+(?:world\s+)?news\b",
+        r"\bworld\s+news\b",
+        r"\bheadlines\b",
+    )
+    return any(re.search(p, low, re.IGNORECASE) for p in patterns)
+
+
+def _parse_world_news_feed(xml_text: str) -> list[dict]:
+    """Parse RSS/Atom feed into normalized news items."""
+    out: list[dict] = []
+    if not xml_text:
+        return out
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return out
+
+    def _txt(el):
+        return (el.text or "").strip() if el is not None and el.text else ""
+
+    # RSS items
+    for item in root.findall(".//item"):
+        title = _txt(item.find("title"))
+        link = _txt(item.find("link"))
+        pub = _txt(item.find("pubDate")) or _txt(item.find("published")) or _txt(item.find("updated"))
+        if title and link:
+            out.append({"title": title, "link": link, "published": pub})
+
+    # Atom entries
+    atom_ns = {"atom": "http://www.w3.org/2005/Atom"}
+    for entry in root.findall(".//atom:entry", atom_ns):
+        title = _txt(entry.find("atom:title", atom_ns))
+        link = ""
+        link_el = entry.find("atom:link[@rel='alternate']", atom_ns) or entry.find("atom:link", atom_ns)
+        if link_el is not None:
+            link = (link_el.get("href") or "").strip()
+        pub = _txt(entry.find("atom:updated", atom_ns)) or _txt(entry.find("atom:published", atom_ns))
+        if title and link:
+            out.append({"title": title, "link": link, "published": pub})
+    return out
+
+
+def _news_time_sort_key(published: str) -> float:
+    s = (published or "").strip()
+    if not s:
+        return 0.0
+    dt = _news_datetime(published)
+    if dt is None:
+        return 0.0
+    return dt.timestamp()
+
+
+def _news_datetime(published: str) -> datetime | None:
+    s = (published or "").strip()
+    if not s:
+        return None
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        pass
+    try:
+        # ISO-like fallback
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _fetch_world_news(limit: int = 8) -> tuple[bool, str]:
+    """Fetch latest world headlines from RSS feeds, prioritizing today's news."""
+    items: list[dict] = []
+    for url in WORLD_NEWS_FEEDS:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                xml_text = resp.read().decode("utf-8", errors="replace")
+            items.extend(_parse_world_news_feed(xml_text))
+        except Exception:
+            continue
+
+    if not items:
+        return False, "I couldn't fetch world news right now. Please try again in a moment."
+
+    # Deduplicate by title/link.
+    seen = set()
+    uniq = []
+    for it in items:
+        key = ((it.get("title") or "").strip().lower(), (it.get("link") or "").strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(it)
+
+    uniq.sort(key=lambda x: _news_time_sort_key(x.get("published") or ""), reverse=True)
+
+    # Prefer items published "today" in local time.
+    today_local = datetime.now().date()
+    todays = []
+    for it in uniq:
+        dt = _news_datetime(it.get("published") or "")
+        if dt is None:
+            continue
+        try:
+            local_date = dt.astimezone().date()
+        except Exception:
+            local_date = dt.date()
+        if local_date == today_local:
+            todays.append(it)
+
+    pick_from = todays if todays else uniq
+    top = pick_from[: max(1, min(limit, 12))]
+    lines = ["📰 **Today's world news headlines:**" if todays else "📰 **Latest world news headlines (no fresh items dated today in feeds):**"]
+    for i, it in enumerate(top, 1):
+        title = (it.get("title") or "Untitled").strip()
+        link = (it.get("link") or "").strip()
+        lines.append(f"{i}. {title}\n{link}")
+    return True, "\n\n".join(lines)
 
 
 def _intent_requires_tool_call(text: str) -> bool:
@@ -3453,6 +3681,228 @@ def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tu
             pass
 
 
+def _can_use_whatsapp_discord(author_id: int) -> bool:
+    """Allow WhatsApp call/msg automation on Discord only for linked user or admin."""
+    if _discord_admin_id_int is not None and author_id == _discord_admin_id_int:
+        return True
+    if _linked_discord_id_int is not None and author_id == _linked_discord_id_int:
+        return True
+    return False
+
+
+def _get_whatsapp_exe_path() -> str | None:
+    """Return path to WhatsApp.exe (Windows). Tries WHATSAPP_APP_PATH then common install locations."""
+    if sys.platform != "win32":
+        return None
+    if WHATSAPP_APP_PATH and os.path.isfile(WHATSAPP_APP_PATH):
+        return WHATSAPP_APP_PATH
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if local_app_data:
+        default = os.path.join(local_app_data, "WhatsApp", "WhatsApp.exe")
+        if os.path.isfile(default):
+            return default
+    return WHATSAPP_APP_PATH or (local_app_data and os.path.join(local_app_data, "WhatsApp", "WhatsApp.exe")) or None
+
+
+def _launch_whatsapp_via_start_menu() -> bool:
+    """Open Start menu, search for WhatsApp, and click to launch (Windows). Works even when exe path is unknown."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import pyautogui
+    except ImportError:
+        return False
+    try:
+        # Win key opens Start; on Win10/11 focus is in search, so we can type
+        pyautogui.press("win")
+        time.sleep(0.6)
+        pyautogui.write("whatsapp", interval=0.06)
+        time.sleep(1.2)
+        pyautogui.press("enter")
+        time.sleep(5)
+        return True
+    except Exception:
+        return False
+
+
+def _launch_whatsapp_desktop_if_needed() -> bool:
+    """Start WhatsApp Desktop if not running (Windows). Tries existing window, exe path, then Start menu search."""
+    if sys.platform != "win32":
+        return False
+    # 1) Already running on any monitor?
+    try:
+        from pywinauto import Application
+        app = Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=2)
+        if app.windows():
+            return True
+    except Exception:
+        pass
+    # 2) Launch via exe path if we have it
+    path = _get_whatsapp_exe_path()
+    if path and os.path.isfile(path):
+        try:
+            subprocess.Popen([path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(5)
+            try:
+                Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=5)
+                return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+    # 3) Fallback: Start menu — open Start, search "whatsapp", press Enter
+    if _launch_whatsapp_via_start_menu():
+        try:
+            Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=12)
+            return True
+        except Exception:
+            return True  # we launched something; user may need to wait a bit
+    return False
+
+
+def _run_whatsapp_desktop_open_contact(contact_name: str) -> tuple[bool, str]:
+    """Open WhatsApp Desktop, search for contact, select from list (opens chat). Windows only."""
+    if sys.platform != "win32":
+        return False, "WhatsApp automation is only supported on Windows."
+    contact_name = (contact_name or "").strip()
+    if not contact_name:
+        return False, "Please provide a contact name (e.g. !msg Marios)."
+    try:
+        from pywinauto import Application
+    except ImportError:
+        return False, "pywinauto is not installed. Run: pip install pywinauto"
+    if not _launch_whatsapp_desktop_if_needed():
+        return False, (
+            "Could not start or find WhatsApp. "
+            "Luna tried: (1) existing window, (2) launching via exe path, (3) Start menu → search 'whatsapp' → Enter. "
+            "Install WhatsApp Desktop, or set WHATSAPP_APP_PATH in .env to your WhatsApp.exe path."
+        )
+    win = None
+    try:
+        app = Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=12)
+        win = app.window(title_re=r".*WhatsApp.*")
+    except Exception:
+        try:
+            from pywinauto import Desktop
+            desktop = Desktop(backend="uia")
+            for w in desktop.windows():
+                try:
+                    t = (w.window_text() or "")
+                    if "WhatsApp" in t:
+                        win = w
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    if not win:
+        return False, "WhatsApp is open but Luna could not attach to it. Focus the WhatsApp window and try !call again."
+    try:
+        win.set_focus()
+        time.sleep(0.5)
+        win.type_keys("^f")
+        time.sleep(0.4)
+        win.type_keys(contact_name, with_spaces=True)
+        time.sleep(1.2)
+        win.type_keys("{ENTER}")
+        time.sleep(0.8)
+        return True, f"Opened chat with **{contact_name}**."
+    except Exception as e:
+        err = (str(e) or "unknown")[:180]
+        return False, f"WhatsApp automation error: {err}"
+
+
+def _run_whatsapp_desktop_call(contact_name: str) -> tuple[bool, str]:
+    """Open contact in WhatsApp Desktop, click Call (top right), then click Voice in the dropdown."""
+    ok, msg = _run_whatsapp_desktop_open_contact(contact_name)
+    if not ok:
+        return ok, msg
+    if sys.platform != "win32":
+        return True, msg
+    try:
+        from pywinauto import Application
+        from pywinauto import Desktop
+        import pyautogui
+        win = None
+        try:
+            app = Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=8)
+            win = app.window(title_re=r".*WhatsApp.*")
+        except Exception:
+            try:
+                desktop = Desktop(backend="uia")
+                for w in desktop.windows():
+                    try:
+                        if "WhatsApp" in (w.window_text() or ""):
+                            win = w
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        if not win:
+            return True, f"Opened **{contact_name}**. Luna could not find the WhatsApp window for the call button. Tap Call then Voice manually."
+        win.set_focus()
+        time.sleep(0.5)
+        rect = win.rectangle()
+        call_clicked = False
+        # Step 1: Click the Call button (top right, next to search) to open the dropdown
+        for name in ("Call", "Voice call", "Phone"):
+            pattern = f".*{re.escape(name)}.*"
+            for ctrl_type in ("Button", "Hyperlink", "MenuItem", "Text", None):
+                try:
+                    if ctrl_type:
+                        btn = win.child_window(title_re=pattern, control_type=ctrl_type)
+                    else:
+                        btn = win.child_window(title_re=pattern)
+                    if btn.exists(timeout=0.8) and btn.is_enabled():
+                        btn.click()
+                        call_clicked = True
+                        break
+                except Exception:
+                    continue
+            if call_clicked:
+                break
+        if not call_clicked and rect.width() > 100 and rect.height() > 100:
+            pyautogui.click(rect.right - 180, rect.top + 45)
+            call_clicked = True
+        if not call_clicked:
+            return True, f"Opened **{contact_name}**. Could not find Call button; tap Call then Voice."
+        time.sleep(0.7)
+        # Step 2: Click the "Voice" option in the dropdown
+        voice_clicked = False
+        for name in ("Voice", "Voice call"):
+            pattern = f".*{re.escape(name)}.*"
+            for ctrl_type in ("Button", "MenuItem", "Hyperlink", "Text", None):
+                try:
+                    if ctrl_type:
+                        btn = win.child_window(title_re=pattern, control_type=ctrl_type)
+                    else:
+                        btn = win.child_window(title_re=pattern)
+                    if btn.exists(timeout=0.8) and btn.is_enabled():
+                        btn.click()
+                        voice_clicked = True
+                        break
+                except Exception:
+                    continue
+            if voice_clicked:
+                break
+        if not voice_clicked and rect.width() > 100 and rect.height() > 100:
+            # Voice is the first item in the dropdown, below the Call button
+            pyautogui.click(rect.right - 180, rect.top + 95)
+            voice_clicked = True
+        time.sleep(0.3)
+        if voice_clicked:
+            return True, f"Started a voice call with **{contact_name}**."
+        return True, f"Opened Call menu for **{contact_name}**. Tap Voice to start the call."
+    except Exception as e:
+        return True, f"Opened **{contact_name}**. Tap Call then Voice to start the call. ({e})"
+
+
+def _run_whatsapp_desktop_msg(contact_name: str) -> tuple[bool, str]:
+    """Open WhatsApp Desktop and open chat with contact (ready to type message)."""
+    return _run_whatsapp_desktop_open_contact(contact_name)
+
+
 def _stream_tts_chunks(text: str):
     """Stream TTS with gTTS: yield SSE events as each chunk is ready."""
     for chunk_text in _split_into_chunks(text):
@@ -3520,29 +3970,224 @@ def _normalize_luna_path(path: str) -> str:
     return p.strip() or path.strip()
 
 
-def _parse_luna_write(reply: str) -> tuple[str, str | None, str | None]:
-    """If Luna's reply contains a LUNA_WRITE_FILE block, return (cleaned_reply, path, content). Else (reply, None, None)."""
+def _parse_luna_writes(reply: str) -> tuple[str, list[dict]]:
+    """
+    Parse one or more LUNA_WRITE_FILE blocks.
+    Returns (cleaned_reply_without_blocks, writes[]), where writes contains
+    dict entries: {"path": <relative_path>, "content": <text>}.
+    """
     if not reply or "LUNA_WRITE_FILE" not in reply or "END_LUNA_WRITE" not in reply:
-        return reply, None, None
-    start = reply.find("LUNA_WRITE_FILE")
-    end = reply.find("END_LUNA_WRITE")
-    if start == -1 or end == -1 or end <= start:
-        return reply, None, None
-    block = reply[start : end + len("END_LUNA_WRITE")]
-    rest_before = reply[:start].rstrip()
-    path = ""
-    for line in block.split("\n"):
-        if line.strip().lower().startswith("path:"):
-            path = line.split(":", 1)[1].strip().strip('"\'')
+        return reply, []
+
+    pattern = re.compile(r"LUNA_WRITE_FILE(.*?)END_LUNA_WRITE", re.DOTALL | re.IGNORECASE)
+    matches = list(pattern.finditer(reply))
+    if not matches:
+        return reply, []
+
+    writes: list[dict] = []
+    for m in matches:
+        block = m.group(0)
+        path = ""
+        for line in block.split("\n"):
+            if line.strip().lower().startswith("path:"):
+                path = line.split(":", 1)[1].strip().strip('"\'')
+                break
+        if not path:
+            continue
+        if "---" in block and "END_LUNA_WRITE" in block:
+            content = block[block.index("---") + 4 : block.upper().rfind("END_LUNA_WRITE")].strip()
+        else:
+            content = ""
+        writes.append({"path": _normalize_luna_path(path), "content": content})
+
+    cleaned = pattern.sub("", reply).strip()
+    return cleaned, writes
+
+
+def _user_wants_file_creation(msg: str) -> bool:
+    """True if the user message suggests they want to create/save files (e.g. game, website, save that, note, txt)."""
+    if not (msg or msg.strip()):
+        return False
+    lower = msg.strip().lower()
+    triggers = (
+        "create a game", "make a game", "website game", "create a website", "make a website",
+        "save that", "save it", "save the", "save these", "save to", "save in",
+        "write that", "write it", "write the", "write this", "put that in", "put it in",
+        "create that", "create those", "create the file", "create these files",
+        "luna projects", "project folder", "in the folder", "to the folder",
+        "create a file", "make a file", "write a file",
+        "note", "txt document", "text file", "save as txt", "write a note", "create a note",
+        "create a text file with", "make a text file with",
+    )
+    return any(t in lower for t in triggers)
+
+
+def _extract_text_file_description(msg: str) -> str | None:
+    """If msg is 'create a text file with (description)', return the description part; else None."""
+    if not (msg or msg.strip()):
+        return None
+    lower = msg.strip().lower()
+    for prefix in ("create a text file with ", "make a text file with "):
+        if lower.startswith(prefix):
+            return msg.strip()[len(prefix):].strip() or None
+        if prefix in lower:
+            idx = lower.find(prefix)
+            return msg[idx + len(prefix):].strip() or None
+    return None
+
+
+def _relatable_note_filename(user_msg: str, content_preview: str) -> str:
+    """Generate a safe .txt filename from the user message or first line of content, for saving to Luna projects."""
+    # Prefer "create a text file with (description)" -> use description for slug
+    desc = _extract_text_file_description(user_msg)
+    if desc:
+        stop = {"a", "the", "to", "in", "as", "me", "my", "for"}
+        slug = ""
+        for word in re.findall(r"[a-zA-Z0-9]+", desc):
+            w = word.lower()
+            if w in stop or len(w) < 2:
+                continue
+            slug = (slug + "_" + w) if slug else w
+            if len(slug) >= 28:
+                break
+        slug = re.sub(r"_+", "_", slug).strip("_") or "note"
+        date_part = datetime.now().strftime("%Y%m%d")
+        return f"note_{date_part}_{slug}.txt" if slug != "note" else f"note_{date_part}.txt"
+    # Fallback: slug from full message or first line of content
+    stop = {"luna", "create", "write", "save", "file", "a", "the", "to", "in", "as", "txt", "me", "this", "that", "it"}
+    slug = ""
+    for word in re.findall(r"[a-zA-Z0-9]+", (user_msg or "").strip()):
+        w = word.lower()
+        if w in stop or len(w) < 2:
+            continue
+        slug = (slug + "_" + w) if slug else w
+        if len(slug) >= 28:
             break
-    if "---" in block and "END_LUNA_WRITE" in block:
-        content = block[block.index("---") + 4 : block.index("END_LUNA_WRITE")].strip()
-    else:
-        content = ""
-    if not path:
-        return reply, None, None
-    path = _normalize_luna_path(path)
-    return rest_before, path, content
+    if not slug:
+        first_line = (content_preview or "").strip().split("\n")[0][:40]
+        slug = re.sub(r"[^\w\s-]", "", first_line).strip().replace(" ", "_")[:28] or "note"
+    slug = re.sub(r"_+", "_", slug).strip("_") or "note"
+    date_part = datetime.now().strftime("%Y%m%d")
+    return f"note_{date_part}_{slug}.txt" if slug != "note" else f"note_{date_part}.txt"
+
+
+def _extract_code_blocks_from_reply(reply: str) -> list[dict]:
+    """
+    Parse markdown code blocks from Luna's reply into writes for Luna projects.
+    Returns list of {"path": "<relative path>", "content": "..."} with default filenames by language.
+    """
+    if not reply or "```" not in reply:
+        return []
+    # Match ```lang\n...\n``` or ```\n...\n```
+    pattern = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
+    matches = list(pattern.finditer(reply))
+    if not matches:
+        return []
+    counts: dict[str, int] = {}
+    default_names: dict[str, tuple[str, str]] = {
+        "html": ("index", ".html"),
+        "css": ("styles", ".css"),
+        "javascript": ("game", ".js"),
+        "js": ("game", ".js"),
+        "json": ("data", ".json"),
+        "text": ("note", ".txt"),
+        "": ("code", ".txt"),
+    }
+    writes: list[dict] = []
+    for m in matches:
+        lang = (m.group(1) or "").strip().lower()
+        content = (m.group(2) or "").strip()
+        if not content or len(content) > 500_000:
+            continue
+        base, ext = default_names.get(lang) or ("code", ".txt")
+        if lang == "html":
+            counts["html"] = counts.get("html", 0) + 1
+            n = counts["html"]
+            path = "index.html" if n == 1 else f"index{n}.html"
+        elif lang == "css":
+            n = counts.get("css", 0) + 1
+            counts["css"] = n
+            path = "css/styles.css" if n == 1 else f"css/styles{n}.css"
+        elif lang in ("javascript", "js"):
+            n = counts.get("js", 0) + 1
+            counts["js"] = n
+            path = "js/game.js" if n == 1 else f"js/game{n}.js"
+        else:
+            key = f"{base}{ext}"
+            n = counts.get(key, 0) + 1
+            counts[key] = n
+            path = f"{base}{ext}" if n == 1 else f"{base}{n}{ext}"
+        writes.append({"path": _normalize_luna_path(path), "content": content})
+    return writes
+
+
+# Intent template for "commands" / "help" — reply without calling Ollama
+LUNA_COMMANDS_REPLY = (
+    "**Luna file access** (only inside Luna projects):\n"
+    "• !read <path> — read file\n"
+    "• !write <path> <content> — write file\n"
+    "• !list [path] — list directory\n"
+    "• !edit <path> <old> -> <new> — replace text in file\n"
+    "• !news — latest world news headlines\n"
+    "• !suno <description> — open Suno and create a song\n"
+    "• !local_song <description> — generate local instrumental + lyrics files\n"
+    "• !share_song (or !share song) — share a random YouTube channel song to X\n"
+    "• !share_facebook (or !share facebook) — share to Facebook\n"
+    "• !yt_comment <youtube_url> — transcribe and post a YouTube comment\n"
+    "• !ig_dm <username|thread_url> [message] — send an Instagram DM\n"
+    "• !remember / !always_remember — store memories\n"
+    "• !profile — view or set your profile\n"
+    "• !join / !leave — voice; !play / !pause / !skip / !stop / !queue — music\n"
+    "• !call <contact> — WhatsApp: open contact and start call (Windows)\n"
+    "• !msg <contact> — WhatsApp: open chat with contact (Windows)"
+)
+
+# Trigger phrases for command/help intent (natural language → template reply)
+_COMMAND_INTENT_TRIGGERS = (
+    "what can you do",
+    "what do you do",
+    "commands",
+    "list commands",
+    "help",
+    "what are your commands",
+    "what can luna do",
+    "luna commands",
+    "what can luna",
+    "show commands",
+)
+
+
+def _get_command_intent_reply(msg: str) -> str | None:
+    """If the user is asking for commands/help, return the commands template. Else None (no Ollama skip)."""
+    if not (msg or msg.strip()):
+        return None
+    low = msg.strip().lower()
+    if any(trigger in low for trigger in _COMMAND_INTENT_TRIGGERS):
+        return LUNA_COMMANDS_REPLY
+    return None
+
+
+def _pending_write_entries(pending: dict | None) -> list[dict]:
+    """Backward-compatible read for pending single-write or multi-write payloads."""
+    if not isinstance(pending, dict):
+        return []
+    entries = pending.get("writes")
+    if isinstance(entries, list):
+        out = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            p = (e.get("path") or "").strip()
+            c = e.get("content") or ""
+            if p:
+                out.append({"path": p, "content": c})
+        if out:
+            return out
+    # Legacy shape: {"path": "...", "content": "..."}
+    p = (pending.get("path") or "").strip()
+    if p:
+        return [{"path": p, "content": pending.get("content") or ""}]
+    return []
 
 
 def _handle_web_file_command(msg: str) -> str | None:
@@ -3584,20 +4229,11 @@ def _handle_web_file_command(msg: str) -> str | None:
             return "Usage: !edit <path> <old_text> -> <new_text>"
         ok, result = luna_modify_file(path, old_text, new_text)
         return f"✅ {result}" if ok else f"❌ {result}"
-    if cmd == "!files":
-        return (
-            f"**Luna file access** (only inside Luna projects):\n"
-            "• !read <path> — read file\n"
-            "• !write <path> <content> — write file\n"
-            "• !list [path] — list directory\n"
-            "• !edit <path> <old> -> <new> — replace text in file\n"
-            "• !suno <description> — open Suno and create a song\n"
-            "• !local_song <description> — generate local instrumental + lyrics files\n"
-            "• !share_song (or !share song) — share a random YouTube channel song to X\n"
-            "• !share_facebook (or !share facebook) — share a random YouTube channel song to Facebook\n"
-            "• !yt_comment <youtube_url> — transcribe and post a thoughtful YouTube comment\n"
-            "• !ig_dm <username|thread_url> [message] — send an Instagram DM"
-        )
+    if cmd in ("!files", "!commands"):
+        return LUNA_COMMANDS_REPLY
+    if cmd == "!news":
+        ok, result = _fetch_world_news()
+        return result if ok else f"❌ {result}"
     if cmd == "!suno":
         if not args:
             return "Usage: !suno <song description>"
@@ -3640,6 +4276,16 @@ def _handle_web_file_command(msg: str) -> str | None:
         custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
         ok, result = _run_instagram_dm(target, custom_message)
         return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "!call":
+        if not args:
+            return "Usage: !call <contact name or number> (e.g. !call Marios or !call +357 96 724268)"
+        ok, result = _run_whatsapp_desktop_call(args)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "!msg":
+        if not args:
+            return "Usage: !msg <contact name or number>"
+        ok, result = _run_whatsapp_desktop_msg(args)
+        return f"✅ {result}" if ok else f"❌ {result}"
     return None
 
 
@@ -3655,14 +4301,28 @@ def api_chat():
     pending_scope = scope if scope in _pending_writes else _pending_write_scope_for_web()
     if _is_confirm_message(msg) and pending_scope is not None:
         pending = _pending_writes.pop(pending_scope)
-        ok, result = luna_write_file(pending["path"], pending["content"])
-        if ok:
-            # result is the absolute path; open it in Notepad (or default app) so user sees it
-            print(f"[Luna] File written to: {result}", flush=True)
-            _open_file_by_path(result)
-            reply = f"✅ File created at:\n{result}\n(Opened in your default editor.)"
+        entries = _pending_write_entries(pending)
+        created_paths = []
+        errors = []
+        for e in entries:
+            ok, result = luna_write_file(e["path"], e["content"])
+            if ok:
+                created_paths.append(result)
+                print(f"[Luna] File written to: {result}", flush=True)
+                _open_file_by_path(result)
+            else:
+                errors.append(f"{e['path']}: {result}")
+        if created_paths and not errors:
+            if len(created_paths) == 1:
+                reply = f"✅ File created at:\n{created_paths[0]}\n(Opened in your default editor.)"
+            else:
+                preview = "\n".join(created_paths[:6])
+                more = f"\n...and {len(created_paths) - 6} more." if len(created_paths) > 6 else ""
+                reply = f"✅ Created {len(created_paths)} files:\n{preview}{more}\n(Opened in your default editor.)"
+        elif created_paths and errors:
+            reply = f"⚠️ Created {len(created_paths)} file(s), but some failed:\n" + "\n".join(errors[:6])
         else:
-            reply = f"❌ {result}"
+            reply = "❌ Could not create files:\n" + ("\n".join(errors[:6]) if errors else "No valid file payload found.")
         append_exchange(pending_scope, msg, reply)
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
@@ -3679,6 +4339,12 @@ def api_chat():
     if file_reply is not None:
         append_exchange(scope, msg, file_reply)
         return jsonify({"reply": file_reply})
+    if _extract_news_request(msg):
+        ok, result = _fetch_world_news()
+        reply = result if ok else f"❌ {result}"
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
     tool_intent = _intent_requires_tool_call(msg)
     ig_username, ig_custom_msg = _extract_instagram_dm_request(msg) if tool_intent else ("", "")
     if tool_intent and ig_username:
@@ -3737,6 +4403,14 @@ def api_chat():
         append_exchange(scope, msg, reply)
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
+    # Intent template: commands/help → reply without Ollama
+    command_reply = _get_command_intent_reply(msg)
+    if command_reply is not None:
+        append_exchange(scope, msg, command_reply)
+        _try_capture_memory(scope, msg)
+        _try_capture_profile(scope, msg)
+        _play_reply_tts_on_pc(command_reply)
+        return jsonify({"reply": command_reply})
     # Use persisted conversation history so context survives restarts and page refresh
     history = get_recent_conversation(scope, 20)
     last_assistant = ""
@@ -3746,10 +4420,17 @@ def api_chat():
             break
     try_capture_profile_from_reply(scope, last_assistant, msg)
     reply = ollama_chat(msg, LUNA_SYSTEM_PROMPT, scope, history)
-    cleaned, path, content = _parse_luna_write(reply)
-    if path is not None and content is not None:
-        _pending_writes[scope] = {"path": path, "content": content}
-        reply = cleaned + "\n\nReply **yes** to create this file in Luna projects, or **no** to cancel."
+    cleaned, writes = _parse_luna_writes(reply)
+    if not writes and _user_wants_file_creation(msg):
+        writes = _extract_code_blocks_from_reply(reply)
+    if not writes and _user_wants_file_creation(msg) and cleaned and len(cleaned.strip()) > 20:
+        path = _relatable_note_filename(msg, cleaned)
+        writes = [{"path": _normalize_luna_path(path), "content": cleaned.strip()}]
+    if writes:
+        _pending_writes[scope] = {"writes": writes}
+        count = len(writes)
+        noun = "file" if count == 1 else "files"
+        reply = cleaned + f"\n\nReply **yes** to create {count} {noun} in Luna projects, or **no** to cancel."
     else:
         reply = cleaned
     append_exchange(scope, msg, reply)
@@ -3794,6 +4475,13 @@ def api_tts_stream():
             "Transfer-Encoding": "chunked",
         },
     )
+
+
+@web_app.route("/api/tts-stop", methods=["POST"])
+def api_tts_stop():
+    """Stop any TTS currently playing on the server (web PC playback)."""
+    _stop_tts_on_pc()
+    return jsonify({"ok": True})
 
 
 def run_web_ui():
@@ -3845,14 +4533,28 @@ async def on_message(message: discord.Message):
         if is_confirm and memory_scope in _pending_writes:
             if is_discord_admin and _discord_admin_id_int is not None:
                 pending = _pending_writes.pop(memory_scope)
-                ok, result = await asyncio.to_thread(luna_write_file, pending["path"], pending["content"])
-                if ok:
-                    # result is the absolute path where the file was written
-                    print(f"[Luna] File written to: {result}", flush=True)
-                    await asyncio.to_thread(_open_file_by_path, result)
-                    reply = f"✅ File created at:\n{result}\n(Opened in your default editor.)"
+                entries = _pending_write_entries(pending)
+                created_paths = []
+                errors = []
+                for e in entries:
+                    ok, result = await asyncio.to_thread(luna_write_file, e["path"], e["content"])
+                    if ok:
+                        created_paths.append(result)
+                        print(f"[Luna] File written to: {result}", flush=True)
+                        await asyncio.to_thread(_open_file_by_path, result)
+                    else:
+                        errors.append(f"{e['path']}: {result}")
+                if created_paths and not errors:
+                    if len(created_paths) == 1:
+                        reply = f"✅ File created at:\n{created_paths[0]}\n(Opened in your default editor.)"
+                    else:
+                        preview = "\n".join(created_paths[:6])
+                        more = f"\n...and {len(created_paths) - 6} more." if len(created_paths) > 6 else ""
+                        reply = f"✅ Created {len(created_paths)} files:\n{preview}{more}\n(Opened in your default editor.)"
+                elif created_paths and errors:
+                    reply = f"⚠️ Created {len(created_paths)} file(s), but some failed:\n" + "\n".join(errors[:6])
                 else:
-                    reply = f"❌ {result}"
+                    reply = "❌ Could not create files:\n" + ("\n".join(errors[:6]) if errors else "No valid file payload found.")
             else:
                 _pending_writes.pop(memory_scope, None)
                 reply = "Only the server admin can create files in Luna projects."
@@ -3862,6 +4564,12 @@ async def on_message(message: discord.Message):
         if text_lower in ("no", "cancel") and memory_scope in _pending_writes:
             _pending_writes.pop(memory_scope, None)
             reply = "Cancelled."
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        if _extract_news_request(text):
+            ok, result = await asyncio.to_thread(_fetch_world_news)
+            reply = result if ok else f"❌ {result}"
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
@@ -3933,6 +4641,12 @@ async def on_message(message: discord.Message):
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
+        # Intent template: commands/help → reply without Ollama
+        command_reply = _get_command_intent_reply(text)
+        if command_reply is not None:
+            await asyncio.to_thread(append_exchange, memory_scope, text, command_reply)
+            await message.reply(f"{mention} {command_reply}")
+            return
         # If Luna's last message was a profile question, treat this reply as the answer
         await asyncio.to_thread(try_capture_profile_from_reply, memory_scope, _last_assistant_by_scope.get(memory_scope, ""), text)
         # Load persisted conversation so Luna has context across restarts
@@ -3940,11 +4654,18 @@ async def on_message(message: discord.Message):
         try:
             async with message.channel.typing():
                 reply = await asyncio.to_thread(ollama_chat, text, LUNA_SYSTEM_PROMPT, memory_scope, history)
-            cleaned, write_path, write_content = _parse_luna_write(reply)
-            if write_path is not None and write_content is not None:
+            cleaned, writes = _parse_luna_writes(reply)
+            if not writes and _user_wants_file_creation(text):
+                writes = _extract_code_blocks_from_reply(reply)
+            if not writes and _user_wants_file_creation(text) and cleaned and len(cleaned.strip()) > 20:
+                path = _relatable_note_filename(text, cleaned)
+                writes = [{"path": _normalize_luna_path(path), "content": cleaned.strip()}]
+            if writes:
                 if is_discord_admin and _discord_admin_id_int is not None:
-                    _pending_writes[memory_scope] = {"path": write_path, "content": write_content}
-                    reply = cleaned + "\n\nReply **yes** to create this file in Luna projects, or **no** to cancel."
+                    _pending_writes[memory_scope] = {"writes": writes}
+                    count = len(writes)
+                    noun = "file" if count == 1 else "files"
+                    reply = cleaned + f"\n\nReply **yes** to create {count} {noun} in Luna projects, or **no** to cancel."
                 else:
                     reply = cleaned + "\n\nOnly the server admin can create files in Luna projects."
             else:
@@ -3956,12 +4677,11 @@ async def on_message(message: discord.Message):
             if len(reply) > 1900:
                 reply = reply[:1897] + "..."
             await message.reply(f"{mention} {reply}")
-            # If Luna is in a voice channel in this guild, speak the reply with gTTS.
+            # If Luna is in a voice channel in this guild, speak the reply with gTTS (no code read aloud).
             if message.guild:
                 vc = next((c for c in bot.voice_clients if c.guild == message.guild and c.is_connected()), None)
                 if vc and not vc.is_playing():
-                    reply_clean = re.sub(r"<@!?\d+>", "", reply).strip()
-                    reply_clean = re.sub(r"\*\*", "", reply_clean)
+                    reply_clean = _reply_text_for_tts(reply)
                     if reply_clean and len(reply_clean) <= 500:
                         mp3_bytes = await _get_tts_for_discord(reply_clean)
                         if mp3_bytes:
@@ -4066,14 +4786,21 @@ async def cmd_edit(ctx: commands.Context, *, args: str):
 
 @bot.command(name="files")
 async def cmd_files_help(ctx: commands.Context):
-    """Show Luna's file access (read/write/modify only in Luna projects)."""
-    await ctx.reply(
-        f"**Luna file access** (only inside `{ALLOWED_BASE}`):\n"
-        "• `!read <path>` — read file\n"
-        "• `!write <path> <content>` — write file\n"
-        "• `!list [path]` — list directory\n"
-        "• `!edit <path> <old> <new>` — replace text in file"
-    )
+    """Show Luna's commands (file access, automation, memory, voice)."""
+    await ctx.reply(LUNA_COMMANDS_REPLY)
+
+
+@bot.command(name="commands")
+async def cmd_commands(ctx: commands.Context):
+    """Show Luna's commands — same as !files."""
+    await ctx.reply(LUNA_COMMANDS_REPLY)
+
+
+@bot.command(name="news")
+async def cmd_news(ctx: commands.Context):
+    """Show latest world news headlines."""
+    ok, result = await asyncio.to_thread(_fetch_world_news)
+    await ctx.reply(result if ok else f"❌ {result}")
 
 
 @bot.command(name="suno")
@@ -4499,6 +5226,52 @@ async def cmd_leave(ctx: commands.Context):
     channel_name = ctx.voice_client.channel.name
     await ctx.voice_client.disconnect()
     await ctx.reply(f"Left **{channel_name}**.")
+
+
+@bot.command(name="stoptts")
+async def cmd_stoptts(ctx: commands.Context):
+    """Stop Luna's TTS (or any audio) playing in the current voice channel."""
+    if not ctx.voice_client or not ctx.voice_client.is_connected():
+        await ctx.reply("I'm not in a voice channel, so there's nothing to stop.")
+        return
+    if not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
+        await ctx.reply("I'm not playing anything right now.")
+        return
+    try:
+        ctx.voice_client.stop()
+        await ctx.reply("Stopped.")
+    except Exception as e:
+        await ctx.reply(f"Couldn't stop: {e}")
+
+
+@bot.command(name="call")
+async def cmd_whatsapp_call(ctx: commands.Context, *, contact: str = ""):
+    """Open WhatsApp Desktop, select contact, and start a call (phone icon). Usage: !call <contact name>"""
+    if not _can_use_whatsapp_discord(ctx.author.id):
+        await ctx.reply("Only the linked user or admin can use WhatsApp automation.")
+        return
+    contact = (contact or "").strip()
+    if not contact:
+        await ctx.reply("Usage: `!call <contact name>` (e.g. !call Marios)")
+        return
+    await ctx.reply(f"Opening WhatsApp and starting a call with **{contact}**…")
+    ok, result = await asyncio.to_thread(_run_whatsapp_desktop_call, contact)
+    await ctx.reply(result if ok else f"❌ {result}")
+
+
+@bot.command(name="msg")
+async def cmd_whatsapp_msg(ctx: commands.Context, *, contact: str = ""):
+    """Open WhatsApp Desktop and open chat with contact. Usage: !msg <contact name>"""
+    if not _can_use_whatsapp_discord(ctx.author.id):
+        await ctx.reply("Only the linked user or admin can use WhatsApp automation.")
+        return
+    contact = (contact or "").strip()
+    if not contact:
+        await ctx.reply("Usage: `!msg <contact name>` (e.g. !msg Marios)")
+        return
+    await ctx.reply(f"Opening WhatsApp and chat with **{contact}**…")
+    ok, result = await asyncio.to_thread(_run_whatsapp_desktop_msg, contact)
+    await ctx.reply(result if ok else f"❌ {result}")
 
 
 def main():

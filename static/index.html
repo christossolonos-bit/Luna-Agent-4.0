@@ -127,7 +127,6 @@
       opacity: 0.8;
       margin-bottom: 0.25rem;
     }
-    .msg.luna .msg-body { }
     .input-row {
       display: flex;
       gap: 0.5rem;
@@ -173,6 +172,19 @@
       opacity: 0.5;
       cursor: not-allowed;
     }
+    .btn-stop-tts {
+      padding: 0.75rem 1rem;
+      background: rgba(180, 60, 60, 0.4);
+      border: 1px solid rgba(255, 120, 120, 0.4);
+      border-radius: 10px;
+      color: #e0e8ff;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-stop-tts:hover {
+      background: rgba(200, 80, 80, 0.5);
+    }
     .status {
       font-size: 0.8rem;
       color: rgba(224, 232, 255, 0.5);
@@ -194,6 +206,7 @@
     <div class="chat-log" id="chatLog"></div>
     <div class="input-row">
       <textarea id="input" placeholder="Chat with Luna…" rows="1"></textarea>
+      <button type="button" class="btn-stop-tts" id="stopTts" title="Stop TTS">Stop TTS</button>
       <button type="button" class="btn-send" id="send">Send</button>
     </div>
     <p class="status" id="status"></p>
@@ -203,9 +216,20 @@
     const chatLog = document.getElementById('chatLog');
     const input = document.getElementById('input');
     const sendBtn = document.getElementById('send');
+    const stopTtsBtn = document.getElementById('stopTts');
     const statusEl = document.getElementById('status');
 
     function setStatus(msg) { statusEl.textContent = msg; }
+
+    stopTtsBtn.addEventListener('click', async () => {
+      try {
+        await fetch('/api/tts-stop', { method: 'POST' });
+        setStatus('TTS stopped.');
+        setTimeout(() => setStatus(''), 2000);
+      } catch (_) {
+        setStatus('Could not stop TTS.');
+      }
+    });
 
     function addMessage(who, text) {
       const div = document.createElement('div');
