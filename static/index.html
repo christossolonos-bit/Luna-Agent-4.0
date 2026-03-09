@@ -1,78 +1,135 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Luna</title>
   <style>
-    * { box-sizing: border-box; }
+    * {
+      box-sizing: border-box;
+    }
+
+    :root {
+      --ring-1-grad-1: rgba(0, 255, 255, 0.75);
+      --ring-1-grad-2: rgba(0, 240, 255, 1);
+
+      --ring-2-grad-1: rgba(0, 255, 220, 0.7);
+      --ring-2-grad-2: rgba(50, 255, 255, 1);
+
+      --ring-3-grad-1: rgba(150, 255, 255, 0.75);
+      --ring-3-grad-2: rgba(200, 255, 255, 1);
+
+      --inner-core: rgba(5, 50, 70, 0.95);
+      --inner-glow: rgba(0, 255, 255, 0.5);
+    }
+
     body {
       margin: 0;
       min-height: 100vh;
       font-family: 'Segoe UI', system-ui, sans-serif;
       color: #e0e8ff;
       overflow: hidden;
-      background: #060810;
-      background: linear-gradient(135deg, #060810 0%, #0a1628 20%, #0d2847 40%, #1a3a5c 60%, #0f3460 80%, #060810 100%);
-      background-size: 400% 400%;
-      animation: bgShift 18s ease-in-out infinite;
+      background: #000000;
     }
-    @keyframes bgShift {
-      0%, 100% { background-position: 0% 50%; }
-      33% { background-position: 100% 25%; }
-      66% { background-position: 50% 100%; }
-    }
+
 
     .jarvis-ring {
       position: fixed;
       top: 50%;
       left: 50%;
       transform: translate(-50%, -50%);
-      width: min(90vmin, 480px);
-      height: min(90vmin, 480px);
+      width: min(22.5vmin, 112.5px);
+      height: min(22.5vmin, 112.5px);
       pointer-events: none;
       z-index: 0;
+      perspective: 900px;
+      transform-style: preserve-3d;
     }
-    .ring {
+
+    .jarvis-rings {
       position: absolute;
       inset: 0;
+      transform-style: preserve-3d;
+    }
+
+    .ring {
+      position: absolute;
       border-radius: 50%;
-      border: 2px solid transparent;
-      background: conic-gradient(from 0deg, transparent 0deg, rgba(0, 255, 255, 0.12) 60deg, rgba(100, 200, 255, 0.35) 120deg, rgba(255, 255, 255, 0.15) 180deg, rgba(0, 200, 255, 0.12) 240deg, transparent 300deg);
-      animation: spin 12s linear infinite;
+      border: none;
+      box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+      transition: background 0.3s ease;
+      transform-style: preserve-3d;
+      backface-visibility: visible;
+      -webkit-backface-visibility: visible;
+      will-change: transform;
+      -webkit-mask: radial-gradient(circle, transparent 60%, black 68%, black 100%);
+      mask: radial-gradient(circle, transparent 60%, black 68%, black 100%);
+      animation: spinRing var(--ring-duration, 10s) linear infinite, colorShift 15s linear infinite;
     }
-    .ring:nth-child(2) {
-      inset: 10%;
-      background: conic-gradient(from 180deg, transparent 0deg, rgba(0, 255, 200, 0.1) 80deg, rgba(0, 255, 255, 0.3) 160deg, transparent 240deg);
-      animation-duration: 8s;
-      animation-direction: reverse;
+
+    /* Degree-based spin: orient at --base-deg, spin around axis (--ax, --ay, 0). Use 360deg so loop is seamless. */
+    @keyframes spinRing {
+      to {
+        transform: rotateZ(var(--base-deg, 0deg)) rotateY(90deg) rotate3d(var(--ax, 1), var(--ay, 0), 0, 360deg);
+      }
     }
-    .ring:nth-child(3) {
-      inset: 22%;
-      background: conic-gradient(from 90deg, transparent 0deg, rgba(150, 220, 255, 0.18) 100deg, rgba(255, 255, 255, 0.12) 200deg, transparent 280deg);
-      animation-duration: 14s;
-    }
-    .ring:nth-child(4) {
-      inset: 35%;
-      background: conic-gradient(from 270deg, transparent 0deg, rgba(0, 255, 255, 0.08) 90deg, rgba(80, 180, 255, 0.2) 180deg, transparent 270deg);
-      animation-duration: 20s;
-      animation-direction: reverse;
-    }
+
+
     .ring-inner {
       position: absolute;
       top: 50%;
       left: 50%;
       transform: translate(-50%, -50%);
-      width: 24%;
-      height: 24%;
+      width: 20%;
+      height: 20%;
       border-radius: 50%;
-      background: radial-gradient(circle, rgba(0, 255, 255, 0.2) 0%, transparent 70%);
-      box-shadow: 0 0 50px rgba(0, 255, 255, 0.15);
-      animation: pulse 4s ease-in-out infinite;
+      background: radial-gradient(circle at 30% 30%, rgba(0, 120, 160, 0.4) 0%, var(--inner-core) 50%, transparent 100%);
+      box-shadow: 0 0 25px var(--inner-glow), 0 0 50px rgba(0, 255, 255, 0.15), inset -2px -2px 8px rgba(0, 255, 255, 0.1);
+      animation: pulse 3s ease-in-out infinite, colorShift 10s linear infinite;
+      z-index: 2;
+      transition: background 1s ease, box-shadow 1s ease;
+      will-change: transform;
     }
-    @keyframes spin { to { transform: rotate(360deg); } }
+
+
+
+    @keyframes colorShift {
+      0% {
+        filter: hue-rotate(0deg) contrast(1.1) brightness(1.1);
+      }
+      100% {
+        filter: hue-rotate(360deg) contrast(1.1) brightness(1.1);
+      }
+    }
+
     @keyframes pulse {
-      50% { opacity: 0.75; transform: translate(-50%, -50%) scale(1.08); }
+      0%, 100% {
+        opacity: 0.85;
+        transform: translate(-50%, -50%) scale(0.98);
+        box-shadow: 0 0 25px rgba(0, 255, 255, 0.5), 0 0 45px rgba(0, 255, 255, 0.1), inset -2px -2px 8px rgba(0, 255, 255, 0.1);
+      }
+      50% {
+        opacity: 1;
+        transform: translate(-50%, -50%) scale(1.04);
+        box-shadow: 0 0 40px rgba(0, 255, 255, 0.6), 0 0 70px rgba(0, 255, 255, 0.2), inset -2px -2px 10px rgba(0, 255, 255, 0.15);
+      }
+    }
+
+    @keyframes titlePulse {
+
+      0%,
+      100% {
+        text-shadow: 0 0 10px rgba(0, 255, 255, 0.4);
+        transform: scale(1);
+        opacity: 0.9;
+      }
+
+      50% {
+        text-shadow: 0 0 25px rgba(0, 255, 255, 0.9), 0 0 45px rgba(0, 255, 255, 0.5);
+        transform: scale(1.03);
+        opacity: 1;
+      }
     }
 
     .ui {
@@ -85,16 +142,21 @@
       margin: 0 auto;
       padding: 1rem;
     }
+
     .title {
-      font-size: 1.75rem;
-      font-weight: 300;
-      letter-spacing: 0.25em;
+      font-size: 1.85rem;
+      font-weight: 800;
+      letter-spacing: 0.3em;
       text-transform: uppercase;
-      color: rgba(0, 255, 255, 0.95);
+      color: #ffffff;
       text-align: center;
       margin: 0.5rem 0 0 0;
-      text-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+      text-shadow: 0 0 15px rgba(0, 255, 255, 0.6);
+      animation: titlePulse 4s ease-in-out infinite;
+      display: inline-block;
+      width: 100%;
     }
+
     .chat-log {
       flex: 1;
       overflow-y: auto;
@@ -103,6 +165,7 @@
       flex-direction: column;
       gap: 0.75rem;
     }
+
     .msg {
       max-width: 85%;
       padding: 0.65rem 1rem;
@@ -110,30 +173,35 @@
       line-height: 1.4;
       word-wrap: break-word;
     }
+
     .msg.user {
       align-self: flex-end;
       background: rgba(0, 100, 200, 0.35);
       border: 1px solid rgba(0, 200, 255, 0.4);
       color: #e0e8ff;
     }
+
     .msg.luna {
       align-self: flex-start;
       background: rgba(10, 25, 45, 0.85);
       border: 1px solid rgba(0, 255, 255, 0.25);
       color: #e0e8ff;
     }
+
     .msg .label {
       font-size: 0.7rem;
       opacity: 0.8;
       margin-bottom: 0.25rem;
     }
-    .msg.luna .msg-body { }
+
+
     .input-row {
       display: flex;
       gap: 0.5rem;
       padding: 0.75rem 0;
       border-top: 1px solid rgba(0, 255, 255, 0.2);
     }
+
     .input-row textarea {
       flex: 1;
       min-height: 48px;
@@ -148,13 +216,16 @@
       outline: none;
       font-family: inherit;
     }
+
     .input-row textarea::placeholder {
       color: rgba(224, 232, 255, 0.45);
     }
+
     .input-row textarea:focus {
       border-color: rgba(0, 255, 255, 0.6);
       box-shadow: 0 0 12px rgba(0, 255, 255, 0.15);
     }
+
     .btn-send {
       padding: 0.75rem 1.25rem;
       background: linear-gradient(180deg, rgba(0, 180, 220, 0.5) 0%, rgba(0, 120, 180, 0.5) 100%);
@@ -165,38 +236,787 @@
       cursor: pointer;
       transition: background 0.2s, box-shadow 0.2s;
     }
+
     .btn-send:hover {
       background: linear-gradient(180deg, rgba(0, 200, 240, 0.5) 0%, rgba(0, 140, 200, 0.5) 100%);
       box-shadow: 0 0 16px rgba(0, 255, 255, 0.25);
     }
+
     .btn-send:disabled {
       opacity: 0.5;
       cursor: not-allowed;
     }
+
     .status {
       font-size: 0.8rem;
       color: rgba(224, 232, 255, 0.5);
       min-height: 1.2em;
     }
+
+    /* External Message Queue Styles */
+    .external-queue {
+      position: fixed;
+      top: 4rem;
+      left: 1rem;
+      bottom: 1rem;
+      width: 260px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      pointer-events: none;
+      z-index: 10;
+      overflow-y: auto;
+      padding-right: 0.5rem;
+    }
+
+    .external-queue::-webkit-scrollbar {
+      width: 4px;
+    }
+
+    .external-queue::-webkit-scrollbar-thumb {
+      background: rgba(0, 255, 255, 0.1);
+      border-radius: 4px;
+    }
+
+    /* TTS Settings Console */
+    .tts-settings-btn {
+      position: fixed;
+      top: 1.5rem;
+      right: 1.5rem;
+      width: 44px;
+      height: 44px;
+      background: rgba(10, 25, 45, 0.7);
+      border: 1px solid rgba(0, 255, 255, 0.3);
+      border-radius: 50%;
+      color: #00ffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      z-index: 100;
+      transition: all 0.3s ease;
+      font-size: 1.2rem;
+      box-shadow: 0 0 10px rgba(0, 255, 255, 0.1);
+    }
+
+    .tts-settings-btn:hover {
+      background: rgba(0, 255, 255, 0.2);
+      box-shadow: 0 0 15px rgba(0, 255, 255, 0.4);
+      transform: rotate(45deg);
+    }
+
+    .channels-settings-btn {
+      position: fixed;
+      top: 1.5rem;
+      right: 4.25rem;
+      width: 44px;
+      height: 44px;
+      background: rgba(10, 25, 45, 0.7);
+      border: 1px solid rgba(0, 255, 255, 0.3);
+      border-radius: 50%;
+      color: #00ffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      z-index: 100;
+      transition: all 0.3s ease;
+      font-size: 1.1rem;
+      box-shadow: 0 0 10px rgba(0, 255, 255, 0.1);
+    }
+
+    .channels-settings-btn:hover {
+      background: rgba(0, 255, 255, 0.2);
+      box-shadow: 0 0 15px rgba(0, 255, 255, 0.4);
+    }
+
+    .profile-settings-btn {
+      position: fixed;
+      top: 1.5rem;
+      right: 7rem;
+      width: 44px;
+      height: 44px;
+      background: rgba(10, 25, 45, 0.7);
+      border: 1px solid rgba(0, 255, 255, 0.3);
+      border-radius: 50%;
+      color: #00ffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      z-index: 100;
+      transition: all 0.3s ease;
+      font-size: 1.1rem;
+      box-shadow: 0 0 10px rgba(0, 255, 255, 0.1);
+    }
+
+    .profile-settings-btn:hover {
+      background: rgba(0, 255, 255, 0.2);
+      box-shadow: 0 0 15px rgba(0, 255, 255, 0.4);
+    }
+
+    .profile-panel .profile-field {
+      margin-bottom: 1.25rem;
+    }
+
+    .profile-panel .profile-field .label {
+      font-size: 0.7rem;
+      color: rgba(224, 232, 255, 0.5);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.3rem;
+    }
+
+    .profile-panel .profile-field .value {
+      font-size: 0.95rem;
+      color: #e0e8ff;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+
+    .profile-panel .profile-empty {
+      color: rgba(224, 232, 255, 0.4);
+      font-style: italic;
+    }
+
+    .profile-panel .profile-intro {
+      font-size: 0.85rem;
+      color: rgba(224, 232, 255, 0.7);
+      margin-bottom: 1.5rem;
+      line-height: 1.5;
+    }
+
+    .settings-panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 320px;
+      height: 100vh;
+      background: rgba(5, 10, 20, 0.95);
+      border-left: 1px solid rgba(0, 255, 255, 0.2);
+      z-index: 101;
+      padding: 2rem;
+      transform: translateX(100%);
+      transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(10px);
+      overflow-y: auto;
+    }
+
+    .settings-panel.open {
+      transform: translateX(0);
+    }
+
+    .settings-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+      border-bottom: 1px solid rgba(0, 255, 255, 0.1);
+      padding-bottom: 1rem;
+    }
+
+    .settings-header h2 {
+      margin: 0;
+      font-size: 1.1rem;
+      color: #00ffff;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+    }
+
+    .close-settings {
+      background: transparent;
+      border: none;
+      color: rgba(0, 255, 255, 0.6);
+      cursor: pointer;
+      font-size: 1.5rem;
+      line-height: 1;
+    }
+
+    .close-settings:hover {
+      color: #00ffff;
+    }
+
+    .setting-group {
+      margin-bottom: 1.5rem;
+    }
+
+    .setting-group label {
+      display: block;
+      font-size: 0.75rem;
+      margin-bottom: 0.6rem;
+      color: rgba(224, 232, 255, 0.6);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .setting-group select,
+    .setting-group textarea {
+      width: 100%;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(0, 255, 255, 0.2);
+      border-radius: 8px;
+      color: #fff;
+      padding: 0.7rem;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .setting-group select:focus,
+    .setting-group textarea:focus {
+      border-color: rgba(0, 255, 255, 0.5);
+    }
+
+    .setting-group select option {
+      background: #0a1423;
+      color: #fff;
+    }
+
+    .setting-group textarea {
+      height: 100px;
+      resize: none;
+      font-family: inherit;
+      line-height: 1.4;
+    }
+
+    .setting-group input[type="text"] {
+      width: 100%;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(0, 255, 255, 0.2);
+      border-radius: 8px;
+      color: #fff;
+      padding: 0.7rem;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .setting-group input[type="text"]:focus {
+      border-color: rgba(0, 255, 255, 0.5);
+    }
+
+    .settings-section-title {
+      font-size: 0.8rem;
+      margin: 1.25rem 0 0.75rem 0;
+      color: rgba(0, 255, 255, 0.9);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      border-bottom: 1px solid rgba(0, 255, 255, 0.15);
+      padding-bottom: 0.4rem;
+    }
+
+    .settings-section-title:first-of-type {
+      margin-top: 0;
+    }
+
+    .setting-group .range-group {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .setting-group input[type="range"] {
+      flex: 1;
+      accent-color: #00ffff;
+      cursor: pointer;
+    }
+
+    .setting-group .val {
+      font-size: 0.85rem;
+      min-width: 2.5em;
+      text-align: right;
+      color: #00ffff;
+      font-family: monospace;
+    }
+
+    .save-settings-btn {
+      width: 100%;
+      padding: 0.9rem;
+      background: rgba(0, 255, 255, 0.1);
+      border: 1px solid rgba(0, 255, 255, 0.3);
+      color: #00ffff;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: bold;
+      margin-top: 1rem;
+      transition: all 0.2s;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .save-settings-btn:hover {
+      background: rgba(0, 255, 255, 0.2);
+      box-shadow: 0 0 20px rgba(0, 255, 255, 0.25);
+    }
+
+    .model-status {
+      font-size: 0.7rem;
+      margin-top: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    .status-dot.online {
+      background: #00ff88;
+      box-shadow: 0 0 8px #00ff88;
+    }
+
+    .status-dot.offline {
+      background: #ff4444;
+    }
+
+    .external-msg {
+      pointer-events: auto;
+      background: rgba(10, 20, 35, 0.7);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(0, 255, 255, 0.15);
+      border-left: 3px solid #00d2ff;
+      padding: 0.75rem;
+      border-radius: 8px;
+      color: #e0e8ff;
+      font-size: 0.85rem;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      animation: slideIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+      position: relative;
+    }
+
+    @keyframes slideIn {
+      from {
+        transform: translateX(-120%);
+        opacity: 0;
+      }
+
+      to {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+
+    .external-msg.fade-out {
+      animation: fadeOut 0.5s ease forwards;
+    }
+
+    @keyframes fadeOut {
+      to {
+        transform: scale(0.9);
+        opacity: 0;
+      }
+    }
+
+    .external-msg .header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 0.25rem;
+      font-weight: bold;
+      color: #00d2ff;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .external-msg .content {
+      line-height: 1.3;
+      word-break: break-word;
+    }
+
+    .external-msg .footer {
+      margin-top: 0.4rem;
+      font-size: 0.7rem;
+      opacity: 0.5;
+      text-align: right;
+    }
+
+    /* Commands dropdown - left side, matches circle theme */
+    .commands-wrap {
+      position: fixed;
+      left: 1.5rem;
+      top: 1.5rem;
+      z-index: 50;
+      pointer-events: auto;
+    }
+
+    .commands-btn {
+      width: 44px;
+      height: 44px;
+      background: rgba(10, 25, 45, 0.7);
+      border: 1px solid rgba(0, 255, 255, 0.3);
+      border-radius: 50%;
+      color: #00ffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      z-index: 100;
+      transition: all 0.3s ease;
+      font-size: 1.1rem;
+      box-shadow: 0 0 10px rgba(0, 255, 255, 0.1);
+    }
+
+    .commands-btn:hover {
+      background: rgba(0, 255, 255, 0.2);
+      box-shadow: 0 0 15px rgba(0, 255, 255, 0.4);
+    }
+
+    .commands-btn.open {
+      background: rgba(0, 255, 255, 0.25);
+      box-shadow: 0 0 15px rgba(0, 255, 255, 0.4);
+    }
+
+    .commands-dropdown {
+      position: absolute;
+      left: 0;
+      top: 52px;
+      background: rgba(5, 10, 20, 0.96);
+      border: 1px solid rgba(0, 255, 255, 0.2);
+      border-radius: 8px;
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.3s ease;
+      width: 280px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+
+    .commands-dropdown.open {
+      max-height: 70vh;
+      overflow-y: auto;
+    }
+
+    .commands-dropdown .cmd-section {
+      padding: 0.6rem 1rem 0.4rem;
+      font-size: 0.7rem;
+      color: rgba(0, 255, 255, 0.9);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border-bottom: 1px solid rgba(0, 255, 255, 0.1);
+    }
+
+    .commands-dropdown .cmd-item {
+      padding: 0.5rem 1rem 0.6rem;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.2);
+    }
+
+    .commands-dropdown .cmd-item:last-child {
+      border-bottom: none;
+    }
+
+    .commands-dropdown .cmd-name {
+      font-family: monospace;
+      font-size: 0.9rem;
+      color: #00ffff;
+      margin-bottom: 0.2rem;
+    }
+
+    .commands-dropdown .cmd-usage {
+      font-size: 0.75rem;
+      color: rgba(224, 232, 255, 0.7);
+      margin-bottom: 0.15rem;
+      font-family: monospace;
+      word-break: break-all;
+    }
+
+    .commands-dropdown .cmd-desc {
+      font-size: 0.75rem;
+      color: rgba(224, 232, 255, 0.55);
+      line-height: 1.35;
+    }
+
+    .rings-control {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.75rem;
+      padding: 0.4rem 0 0.75rem;
+      pointer-events: auto;
+    }
+
+    .rings-control label {
+      font-size: 0.75rem;
+      color: rgba(0, 255, 255, 0.9);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .rings-control input[type="range"] {
+      width: 100px;
+      accent-color: #00ffff;
+    }
+
+    .rings-control .ring-count {
+      font-size: 0.9rem;
+      min-width: 1.5em;
+      color: #00ffff;
+      font-weight: bold;
+    }
+
+    @media (max-width: 1000px) {
+      .external-queue {
+        width: 100%;
+        left: 0;
+        top: 0;
+        bottom: auto;
+        padding: 0.5rem;
+        flex-direction: row;
+        overflow-x: auto;
+        pointer-events: none;
+        background: linear-gradient(to bottom, rgba(6, 8, 16, 0.8), transparent);
+      }
+
+      .external-msg {
+        min-width: 200px;
+        max-width: 200px;
+        flex-shrink: 0;
+      }
+    }
   </style>
 </head>
+
 <body>
   <div class="jarvis-ring" aria-hidden="true">
-    <div class="ring"></div>
-    <div class="ring"></div>
-    <div class="ring"></div>
-    <div class="ring"></div>
+    <div class="jarvis-rings" id="jarvisRings"></div>
     <div class="ring-inner"></div>
+  </div>
+
+  <div class="external-queue" id="externalQueue"></div>
+
+  <div class="commands-wrap">
+    <button class="commands-btn" id="commandsBtn" title="View Luna's commands">📋</button>
+    <div class="commands-dropdown" id="commandsDropdown">
+      <div class="cmd-section">Memory</div>
+      <div class="cmd-item"><span class="cmd-name">!memories</span><div class="cmd-usage">!memories</div><div class="cmd-desc">View Luna's 4 layers of memory about you (core, long-term, short-term, working).</div></div>
+      <div class="cmd-item"><span class="cmd-name">!remember</span><div class="cmd-usage">!remember &lt;fact&gt;</div><div class="cmd-desc">Store a fact in long-term memory. Example: !remember I prefer dark mode.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!always_remember</span><div class="cmd-usage">!always_remember &lt;fact&gt;</div><div class="cmd-desc">Store an essential fact in core memory (e.g. name). Example: !always_remember My name is Alex.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!forget</span><div class="cmd-usage">!forget</div><div class="cmd-desc">Clear long-term and short-term memories. Core memory is kept.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!forget_all</span><div class="cmd-usage">!forget_all</div><div class="cmd-desc">Clear all memories including core.</div></div>
+      <div class="cmd-section">Profile</div>
+      <div class="cmd-item"><span class="cmd-name">!profile</span><div class="cmd-usage">!profile [set &lt;field&gt; &lt;value&gt;]</div><div class="cmd-desc">View or update your profile (name, location, occupation, interests, birthday). Example: !profile set name Alex</div></div>
+      <div class="cmd-section">Music (Discord voice)</div>
+      <div class="cmd-item"><span class="cmd-name">!play</span><div class="cmd-usage">!play &lt;url or search&gt;</div><div class="cmd-desc">Play YouTube audio in voice channel. Example: !play lo-fi beats</div></div>
+      <div class="cmd-item"><span class="cmd-name">!pause / !resume</span><div class="cmd-usage">!pause | !resume</div><div class="cmd-desc">Pause or resume playback.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!skip / !stop</span><div class="cmd-usage">!skip | !stop</div><div class="cmd-desc">Skip current track or stop and clear queue.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!queue</span><div class="cmd-usage">!queue</div><div class="cmd-desc">Show now playing and upcoming tracks.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!join / !leave</span><div class="cmd-usage">!join | !leave</div><div class="cmd-desc">Join a voice channel or disconnect Luna.</div></div>
+      <div class="cmd-section">Music generation</div>
+      <div class="cmd-item"><span class="cmd-name">!local_song</span><div class="cmd-usage">!local_song &lt;description&gt;</div><div class="cmd-desc">Generate instrumental + lyrics + vocal track locally in Luna projects/music_local.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!suno</span><div class="cmd-usage">!suno &lt;prompt&gt;</div><div class="cmd-desc">Create a song via Suno AI (browser automation, linked/admin only).</div></div>
+      <div class="cmd-section">Sharing (linked/admin)</div>
+      <div class="cmd-item"><span class="cmd-name">!share_song</span><div class="cmd-usage">!share_song</div><div class="cmd-desc">Post a random song from your YouTube channel to X.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!share_facebook</span><div class="cmd-usage">!share_facebook</div><div class="cmd-desc">Post a random channel song to Facebook.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!yt_comment</span><div class="cmd-usage">!yt_comment &lt;video_url&gt;</div><div class="cmd-desc">Transcribe a YouTube video and post a thoughtful comment.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!ig_dm</span><div class="cmd-usage">!ig_dm &lt;username/url&gt; &lt;message&gt;</div><div class="cmd-desc">Send an Instagram DM by username or direct thread URL.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!email</span><div class="cmd-usage">!email &lt;recipient&gt; [subject] &lt;body&gt;</div><div class="cmd-desc">Send an email to an approved contact (linked/admin only).</div></div>
+      <div class="cmd-section">Files (admin only)</div>
+      <div class="cmd-item"><span class="cmd-name">!read</span><div class="cmd-usage">!read &lt;path&gt;</div><div class="cmd-desc">Read a file from Luna projects. Example: !read snippet.html</div></div>
+      <div class="cmd-item"><span class="cmd-name">!write</span><div class="cmd-usage">!write &lt;path&gt; &lt;content&gt;</div><div class="cmd-desc">Write content to a file. Example: !write test.txt Hello world</div></div>
+      <div class="cmd-item"><span class="cmd-name">!list</span><div class="cmd-usage">!list [folder]</div><div class="cmd-desc">List files in Luna projects or a subfolder.</div></div>
+      <div class="cmd-item"><span class="cmd-name">!edit</span><div class="cmd-usage">!edit &lt;path&gt; &lt;old&gt; -&gt; &lt;new&gt;</div><div class="cmd-desc">Replace text in a file. Example: !edit snippet.html old text -> new text</div></div>
+    </div>
   </div>
 
   <div class="ui">
     <h1 class="title">Luna</h1>
+    <div class="rings-control" id="ringsControl">
+      <label for="ringsCount">Rings</label>
+      <input type="range" id="ringsCount" min="2" max="12" value="3" title="Number of rings">
+      <span class="ring-count" id="ringCountVal">3</span>
+    </div>
     <div class="chat-log" id="chatLog"></div>
     <div class="input-row">
       <textarea id="input" placeholder="Chat with Luna…" rows="1"></textarea>
       <button type="button" class="btn-send" id="send">Send</button>
     </div>
     <p class="status" id="status"></p>
+  </div>
+
+  <button class="profile-settings-btn" id="profileSettingsBtn" title="About Me">👤</button>
+  <button class="channels-settings-btn" id="channelsSettingsBtn" title="Channels &amp; URLs">🔗</button>
+  <button class="tts-settings-btn" id="ttsSettingsBtn" title="TTS Settings">⚙️</button>
+
+  <div class="settings-panel profile-panel" id="profileSettingsPanel">
+    <div class="settings-header">
+      <h2>About Me</h2>
+      <button class="close-settings" id="closeProfileSettings">&times;</button>
+    </div>
+    <p class="profile-intro">Profile Luna has gathered about you — from chat, Discord, and things you've shared.</p>
+    <div id="profileContent">
+      <div class="profile-field"><span class="label">Name</span><div class="value" id="profile_name">—</div></div>
+      <div class="profile-field"><span class="label">Location</span><div class="value" id="profile_location">—</div></div>
+      <div class="profile-field"><span class="label">Occupation</span><div class="value" id="profile_occupation">—</div></div>
+      <div class="profile-field"><span class="label">Interests</span><div class="value" id="profile_interests">—</div></div>
+      <div class="profile-field"><span class="label">Birthday</span><div class="value" id="profile_birthday">—</div></div>
+      <div class="profile-field"><span class="label">Other</span><div class="value" id="profile_other">—</div></div>
+    </div>
+  </div>
+
+  <div class="settings-panel" id="channelSettingsPanel" style="width: 380px;">
+    <div class="settings-header">
+      <h2>Channels &amp; URLs</h2>
+      <button class="close-settings" id="closeChannelSettings">&times;</button>
+    </div>
+    <p style="font-size: 0.75rem; color: rgba(224,232,255,0.5); margin-bottom: 1rem;">IDs and web addresses Luna uses. Saved to data/channel_config.json. Token stays in .env only.</p>
+
+    <div class="settings-section-title">Discord (IDs only)</div>
+    <div class="setting-group">
+      <label>Admin ID</label>
+      <input type="text" id="cfg_DISCORD_ADMIN_ID" placeholder="User ID with file permissions">
+    </div>
+    <div class="setting-group">
+      <label>Linked User ID</label>
+      <input type="text" id="cfg_LINKED_DISCORD_USER_ID" placeholder="Web + Discord same memory">
+    </div>
+    <div class="setting-group">
+      <label>DM Sync User IDs</label>
+      <input type="text" id="cfg_DISCORD_DM_SYNC_USER_IDS" placeholder="Comma-separated">
+    </div>
+
+    <div class="settings-section-title">YouTube</div>
+    <div class="setting-group">
+      <label>Channel URL</label>
+      <input type="text" id="cfg_YOUTUBE_CHANNEL_URL" placeholder="https://www.youtube.com/channel/...">
+    </div>
+    <div class="setting-group">
+      <label>Channel ID</label>
+      <input type="text" id="cfg_YOUTUBE_CHANNEL_ID" placeholder="UC...">
+    </div>
+    <div class="setting-group">
+      <label>Profile Dir</label>
+      <input type="text" id="cfg_YOUTUBE_PROFILE_DIR" placeholder="Optional browser profile path">
+    </div>
+    <div class="setting-group">
+      <label>Browser</label>
+      <input type="text" id="cfg_YOUTUBE_BROWSER_CHANNEL" placeholder="chrome or msedge">
+    </div>
+    <div class="setting-group">
+      <label>Browser Path</label>
+      <input type="text" id="cfg_YOUTUBE_BROWSER_PATH" placeholder="Optional executable path">
+    </div>
+
+    <div class="settings-section-title">X (Twitter)</div>
+    <div class="setting-group">
+      <label>Compose URL</label>
+      <input type="text" id="cfg_X_COMPOSE_URL" placeholder="https://x.com/compose/post">
+    </div>
+    <div class="setting-group">
+      <label>Profile URL</label>
+      <input type="text" id="cfg_X_PROFILE_URL" placeholder="https://x.com/...">
+    </div>
+    <div class="setting-group">
+      <label>Handle</label>
+      <input type="text" id="cfg_X_HANDLE" placeholder="@username">
+    </div>
+    <div class="setting-group">
+      <label>Profile Dir</label>
+      <input type="text" id="cfg_X_PROFILE_DIR" placeholder="Optional">
+    </div>
+
+    <div class="settings-section-title">Facebook</div>
+    <div class="setting-group">
+      <label>Profile URL</label>
+      <input type="text" id="cfg_FACEBOOK_PROFILE_URL" placeholder="https://www.facebook.com/...">
+    </div>
+    <div class="setting-group">
+      <label>Home URL</label>
+      <input type="text" id="cfg_FACEBOOK_HOME_URL" placeholder="https://www.facebook.com/">
+    </div>
+    <div class="setting-group">
+      <label>Profile Dir</label>
+      <input type="text" id="cfg_FACEBOOK_PROFILE_DIR" placeholder="Optional">
+    </div>
+
+    <div class="settings-section-title">Instagram</div>
+    <div class="setting-group">
+      <label>Base URL</label>
+      <input type="text" id="cfg_INSTAGRAM_BASE_URL" placeholder="https://www.instagram.com">
+    </div>
+    <div class="setting-group">
+      <label>Profile Dir</label>
+      <input type="text" id="cfg_INSTAGRAM_PROFILE_DIR" placeholder="Optional">
+    </div>
+    <div class="setting-group">
+      <label>Browser</label>
+      <input type="text" id="cfg_INSTAGRAM_BROWSER_CHANNEL" placeholder="chrome or msedge">
+    </div>
+    <div class="setting-group">
+      <label>Browser Path</label>
+      <input type="text" id="cfg_INSTAGRAM_BROWSER_PATH" placeholder="Optional">
+    </div>
+
+    <div class="settings-section-title">Suno</div>
+    <div class="setting-group">
+      <label>Create URL</label>
+      <input type="text" id="cfg_SUNO_CREATE_URL" placeholder="https://suno.com/create">
+    </div>
+    <div class="setting-group">
+      <label>Profile Dir</label>
+      <input type="text" id="cfg_SUNO_PROFILE_DIR" placeholder="Optional">
+    </div>
+    <div class="setting-group">
+      <label>Browser</label>
+      <input type="text" id="cfg_SUNO_BROWSER_CHANNEL" placeholder="chrome or msedge">
+    </div>
+    <div class="setting-group">
+      <label>Browser Path</label>
+      <input type="text" id="cfg_SUNO_BROWSER_PATH" placeholder="Optional">
+    </div>
+
+    <div class="settings-section-title">Approved Email Contacts</div>
+    <p style="font-size: 0.7rem; color: rgba(224,232,255,0.5); margin-bottom: 0.5rem;">Luna sends email only to these contacts. One per line: Name: email@example.com</p>
+    <div class="setting-group">
+      <textarea id="cfg_approved_email_contacts" placeholder="Alice: alice@example.com&#10;Bob: bob@example.com" rows="6" style="height: 120px;"></textarea>
+    </div>
+
+    <button class="save-settings-btn" id="saveChannelSettings">Save Channel Config</button>
+  </div>
+
+  <div class="settings-panel" id="settingsPanel">
+    <div class="settings-header">
+      <h2>Voice Engine</h2>
+      <button class="close-settings" id="closeSettings">&times;</button>
+    </div>
+
+    <div class="setting-group">
+      <label>High Quality (Qwen3-TTS)</label>
+      <select id="ttsEnabled">
+        <option value="true">Enabled (Local GPU)</option>
+        <option value="false">Disabled (Use Google)</option>
+      </select>
+      <div class="model-status">
+        <span class="status-dot" id="modelDot"></span>
+        <span id="modelStatusText">Loading model...</span>
+      </div>
+    </div>
+
+    <div id="qwenSettings">
+      <div class="setting-group">
+        <label>Voice / Speaker</label>
+        <select id="ttsVoice">
+          <option value="Bella">Bella</option>
+        </select>
+      </div>
+
+      <div class="setting-group">
+        <label>Personality / Instructions</label>
+        <textarea id="ttsInstruct" placeholder="e.g. Speak naturally with a warm, caring tone."></textarea>
+      </div>
+
+      <div class="setting-group">
+        <label>Temperature (Creativity)</label>
+        <div class="range-group">
+          <input type="range" id="ttsTemperature" min="0.1" max="1.0" step="0.05" value="0.9">
+          <span class="val" id="ttsTemperatureVal">0.9</span>
+        </div>
+      </div>
+    </div>
+
+    <button class="save-settings-btn" id="saveSettings">Save Configuration</button>
   </div>
 
   <script>
@@ -290,9 +1110,15 @@
                   const binary = atob(data);
                   const bytes = new Uint8Array(binary.length);
                   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-                  queue.push(new Blob([bytes], { type: mime }));
+
+                  // Detect format automatically
+                  let type = 'audio/mpeg';
+                  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
+                    type = 'audio/wav';
+                  }
+                  queue.push(new Blob([bytes], { type: type }));
                   if (!playing) playNext();
-                } catch (_) {}
+                } catch (_) { }
               }
               event = '';
               data = '';
@@ -337,6 +1163,346 @@
         sendBtn.disabled = false;
       }
     }
+
+    // Server-Sent Events for External Message Queue
+    const externalQueue = document.getElementById('externalQueue');
+
+    function addExternalMessage(data) {
+      const card = document.createElement('div');
+      card.className = 'external-msg';
+
+      const timeStr = new Date(data.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      card.innerHTML = `
+        <div class="header">
+          <span>${escapeHtml(data.author)}</span>
+          <span style="opacity:0.6">${escapeHtml(data.platform)}</span>
+        </div>
+        <div class="content">${escapeHtml(data.content)}</div>
+        <div class="footer">${timeStr} • #${escapeHtml(data.channel || 'social')}</div>
+      `;
+
+      externalQueue.prepend(card);
+
+      // Auto-remove after 15 seconds
+      setTimeout(() => {
+        card.classList.add('fade-out');
+        setTimeout(() => card.remove(), 500);
+      }, 15000);
+
+      // Scroll to top of queue
+      externalQueue.scrollTop = 0;
+    }
+
+    const eventSource = new EventSource('/api/events');
+    eventSource.addEventListener('external_message', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        addExternalMessage(data);
+      } catch (err) {
+        console.error('SSE Error:', err);
+      }
+    });
+
+    // SSE Listener for UI updates
+    eventSource.addEventListener('ui_update', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        console.log('UI Update:', data);
+        if (data.css_vars) {
+          for (const [key, val] of Object.entries(data.css_vars)) {
+            document.documentElement.style.setProperty(key, val);
+          }
+        }
+      } catch (err) {
+        console.error('UI Update Error:', err);
+      }
+    });
+
+    eventSource.addEventListener('proactive_message', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        const msg = (data.message || '').trim();
+        if (msg) {
+          addMessage('luna', msg);
+          if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
+            new Notification('Luna', { body: msg }).onclick = () => window.focus();
+          }
+        }
+      } catch (err) {
+        console.error('Proactive message error:', err);
+      }
+    });
+
+    eventSource.onopen = () => {
+      console.log('SSE Connected: Real-time message queue active.');
+      if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission();
+      }
+    };
+    eventSource.onerror = () => {
+      console.warn('SSE Disconnected. Retrying...');
+    };
+
+    // TTS Settings Logic
+    const ttsBtn = document.getElementById('ttsSettingsBtn');
+    const settingsPanel = document.getElementById('settingsPanel');
+    const closeSettings = document.getElementById('closeSettings');
+    const saveSettings = document.getElementById('saveSettings');
+
+    const ttsEnabled = document.getElementById('ttsEnabled');
+    const ttsVoice = document.getElementById('ttsVoice');
+    const ttsInstruct = document.getElementById('ttsInstruct');
+    const ttsTemp = document.getElementById('ttsTemperature');
+    const ttsTempVal = document.getElementById('ttsTemperatureVal');
+    const modelDot = document.getElementById('modelDot');
+    const modelStatusText = document.getElementById('modelStatusText');
+    const qwenSettingsDiv = document.getElementById('qwenSettings');
+
+    const channelSettingsBtn = document.getElementById('channelsSettingsBtn');
+    const channelSettingsPanel = document.getElementById('channelSettingsPanel');
+    const closeChannelSettings = document.getElementById('closeChannelSettings');
+    const saveChannelSettings = document.getElementById('saveChannelSettings');
+
+    const CHANNEL_CONFIG_KEYS = [
+      'DISCORD_ADMIN_ID', 'LINKED_DISCORD_USER_ID', 'DISCORD_DM_SYNC_USER_IDS',
+      'YOUTUBE_CHANNEL_URL', 'YOUTUBE_CHANNEL_ID', 'YOUTUBE_PROFILE_DIR',
+      'YOUTUBE_BROWSER_CHANNEL', 'YOUTUBE_BROWSER_PATH',
+      'X_COMPOSE_URL', 'X_PROFILE_URL', 'X_HANDLE', 'X_PROFILE_DIR',
+      'FACEBOOK_PROFILE_URL', 'FACEBOOK_HOME_URL', 'FACEBOOK_PROFILE_DIR',
+      'INSTAGRAM_BASE_URL', 'INSTAGRAM_PROFILE_DIR', 'INSTAGRAM_BROWSER_CHANNEL', 'INSTAGRAM_BROWSER_PATH',
+      'SUNO_CREATE_URL', 'SUNO_PROFILE_DIR', 'SUNO_BROWSER_CHANNEL', 'SUNO_BROWSER_PATH'
+    ];
+
+    const profileSettingsBtn = document.getElementById('profileSettingsBtn');
+    const profileSettingsPanel = document.getElementById('profileSettingsPanel');
+    const closeProfileSettings = document.getElementById('closeProfileSettings');
+
+    ttsBtn.onclick = () => {
+      profileSettingsPanel.classList.remove('open');
+      channelSettingsPanel.classList.remove('open');
+      settingsPanel.classList.add('open');
+      loadSettings();
+    };
+    channelSettingsBtn.onclick = () => {
+      profileSettingsPanel.classList.remove('open');
+      settingsPanel.classList.remove('open');
+      channelSettingsPanel.classList.add('open');
+      loadChannelSettings();
+    };
+    profileSettingsBtn.onclick = () => {
+      settingsPanel.classList.remove('open');
+      channelSettingsPanel.classList.remove('open');
+      profileSettingsPanel.classList.add('open');
+      loadProfile();
+    };
+    closeSettings.onclick = () => settingsPanel.classList.remove('open');
+    closeChannelSettings.onclick = () => channelSettingsPanel.classList.remove('open');
+    closeProfileSettings.onclick = () => profileSettingsPanel.classList.remove('open');
+
+    ttsTemp.oninput = () => { ttsTempVal.textContent = ttsTemp.value; };
+    ttsEnabled.onchange = () => {
+      qwenSettingsDiv.style.opacity = ttsEnabled.value === 'true' ? '1' : '0.5';
+      qwenSettingsDiv.style.pointerEvents = ttsEnabled.value === 'true' ? 'auto' : 'none';
+    };
+
+    async function loadSettings() {
+      try {
+        const res = await fetch('/api/tts-settings');
+        const data = await res.json();
+        const s = data.settings;
+
+        ttsEnabled.value = s.enabled.toString();
+        ttsVoice.value = s.voice || 'Bella';
+        ttsInstruct.value = s.instruct || '';
+        ttsTemp.value = s.temperature || 0.9;
+        ttsTempVal.textContent = ttsTemp.value;
+
+        // Update voices list
+        if (data.available_voices && data.available_voices.length > 0) {
+          const currentVoice = ttsVoice.value;
+          ttsVoice.innerHTML = '';
+          data.available_voices.forEach(v => {
+            const opt = document.createElement('option');
+            opt.value = v;
+            opt.textContent = v;
+            ttsVoice.appendChild(opt);
+          });
+          ttsVoice.value = currentVoice;
+        }
+
+        if (data.model_loaded) {
+          modelDot.className = 'status-dot online';
+          modelStatusText.textContent = 'Qwen3 Model Ready';
+        } else {
+          modelDot.className = 'status-dot offline';
+          modelStatusText.textContent = 'Model Offline (Initializing...)';
+        }
+
+        ttsEnabled.onchange();
+      } catch (err) {
+        console.error('Failed to load settings:', err);
+      }
+    }
+
+    saveSettings.onclick = async () => {
+      saveSettings.disabled = true;
+      saveSettings.textContent = 'Saving...';
+      try {
+        await fetch('/api/tts-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled: ttsEnabled.value === 'true',
+            voice: ttsVoice.value,
+            instruct: ttsInstruct.value,
+            temperature: parseFloat(ttsTemp.value)
+          })
+        });
+        setTimeout(() => {
+          saveSettings.textContent = 'Settings Saved!';
+          setTimeout(() => {
+            saveSettings.textContent = 'Save Configuration';
+            saveSettings.disabled = false;
+          }, 2000);
+        }, 500);
+      } catch (err) {
+        saveSettings.textContent = 'Error Saving';
+        saveSettings.disabled = false;
+      }
+    };
+
+    async function loadProfile() {
+      try {
+        const res = await fetch('/api/profile');
+        const data = await res.json();
+        const profile = data.profile || {};
+        const fields = ['name', 'location', 'occupation', 'interests', 'birthday', 'other'];
+        fields.forEach(f => {
+          const el = document.getElementById('profile_' + f);
+          if (el) el.textContent = (profile[f] || '').trim() || '—';
+          if (el) el.classList.toggle('profile-empty', !(profile[f] || '').trim());
+        });
+      } catch (err) {
+        console.error('Failed to load profile:', err);
+      }
+    }
+
+    async function loadChannelSettings() {
+      try {
+        const res = await fetch('/api/channel-settings');
+        const data = await res.json();
+        const config = data.config || {};
+        CHANNEL_CONFIG_KEYS.forEach(key => {
+          const el = document.getElementById('cfg_' + key);
+          if (el) el.value = config[key] || '';
+        });
+        const contactsRes = await fetch('/api/approved-email-contacts');
+        const contactsData = await contactsRes.json();
+        const contacts = contactsData.contacts || {};
+        const el = document.getElementById('cfg_approved_email_contacts');
+        if (el) el.value = Object.entries(contacts).map(([n, e]) => `${n}: ${e}`).join('\n');
+      } catch (err) {
+        console.error('Failed to load channel settings:', err);
+      }
+    }
+
+    saveChannelSettings.onclick = async () => {
+      saveChannelSettings.disabled = true;
+      saveChannelSettings.textContent = 'Saving...';
+      try {
+        const config = {};
+        CHANNEL_CONFIG_KEYS.forEach(key => {
+          const el = document.getElementById('cfg_' + key);
+          if (el) config[key] = (el.value || '').trim();
+        });
+        await fetch('/api/channel-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(config)
+        });
+        const contactsEl = document.getElementById('cfg_approved_email_contacts');
+        const contacts = {};
+        if (contactsEl) {
+          (contactsEl.value || '').split('\n').forEach(line => {
+            const idx = line.indexOf(':');
+            if (idx > 0) {
+              const name = line.slice(0, idx).trim();
+              const email = line.slice(idx + 1).trim();
+              if (name && email) contacts[name] = email;
+            }
+          });
+          const cr = await fetch('/api/approved-email-contacts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(contacts)
+          });
+          const cd = await cr.json();
+          if (cd.error) throw new Error(cd.error);
+        }
+        saveChannelSettings.textContent = 'Saved!';
+        setTimeout(() => {
+          saveChannelSettings.textContent = 'Save Channel Config';
+          saveChannelSettings.disabled = false;
+        }, 2000);
+      } catch (err) {
+        saveChannelSettings.textContent = 'Error';
+        saveChannelSettings.disabled = false;
+        console.error(err);
+      }
+    };
+
+    // Gyroscope rings: dynamic count, degree-based orientation
+    const RING_GRADIENTS = [
+      'conic-gradient(from 0deg, var(--ring-1-grad-1) 0deg, var(--ring-1-grad-2) 90deg, var(--ring-1-grad-1) 180deg, transparent 270deg, var(--ring-1-grad-1) 360deg)',
+      'conic-gradient(from 120deg, var(--ring-2-grad-1) 0deg, var(--ring-2-grad-2) 120deg, var(--ring-2-grad-1) 240deg, transparent 330deg, var(--ring-2-grad-1) 360deg)',
+      'conic-gradient(from 240deg, var(--ring-3-grad-1) 0deg, var(--ring-3-grad-2) 150deg, var(--ring-3-grad-1) 300deg, transparent 360deg)'
+    ];
+
+    function buildRings(count) {
+      const container = document.getElementById('jarvisRings');
+      container.innerHTML = '';
+      const baseDuration = 10;
+      for (let i = 0; i < count; i++) {
+        const deg = (360 / count) * i;
+        const rad = (deg * Math.PI) / 180;
+        const ax = Math.cos(rad).toFixed(6);
+        const ay = Math.sin(rad).toFixed(6);
+        const ring = document.createElement('div');
+        ring.className = 'ring';
+        const inset = (i / count) * 20;
+        const duration = baseDuration + (i % 3) * 3;
+        ring.style.cssText = `--base-deg:${deg}deg;--ax:${ax};--ay:${ay};--ring-duration:${duration}s;inset:${inset}%;background:${RING_GRADIENTS[i % 3]}`;
+        container.appendChild(ring);
+      }
+    }
+
+    const ringsCountInput = document.getElementById('ringsCount');
+    const ringCountVal = document.getElementById('ringCountVal');
+    ringsCountInput.addEventListener('input', () => {
+      const n = parseInt(ringsCountInput.value, 10);
+      ringCountVal.textContent = n;
+      buildRings(n);
+    });
+    buildRings(parseInt(ringsCountInput.value, 10));
+
+    // Commands dropdown
+    const commandsBtn = document.getElementById('commandsBtn');
+    const commandsDropdown = document.getElementById('commandsDropdown');
+    commandsBtn.onclick = (e) => {
+      e.stopPropagation();
+      commandsBtn.classList.toggle('open');
+      commandsDropdown.classList.toggle('open');
+    };
+    document.addEventListener('click', () => {
+      commandsBtn.classList.remove('open');
+      commandsDropdown.classList.remove('open');
+    });
+    commandsDropdown.addEventListener('click', (e) => e.stopPropagation());
+
+    // Initial load
+    loadSettings();
   </script>
 </body>
+
 </html>
