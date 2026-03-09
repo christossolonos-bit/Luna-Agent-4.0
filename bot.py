@@ -210,12 +210,14 @@ INSTAGRAM_PROFILE_DIR = os.environ.get(
 INSTAGRAM_BROWSER_CHANNEL = (os.environ.get("INSTAGRAM_BROWSER_CHANNEL") or "chrome").strip().lower()
 INSTAGRAM_BROWSER_PATH = (os.environ.get("INSTAGRAM_BROWSER_PATH") or "").strip()
 INSTAGRAM_BASE_URL = (os.environ.get("INSTAGRAM_BASE_URL") or "https://www.instagram.com").strip().rstrip("/")
-# WhatsApp Desktop (Windows): optional path to WhatsApp.exe; default %LOCALAPPDATA%\WhatsApp\WhatsApp.exe
-if sys.platform == "win32":
-    _whatsapp_default_path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "WhatsApp", "WhatsApp.exe")
-else:
-    _whatsapp_default_path = ""
-WHATSAPP_APP_PATH = (os.environ.get("WHATSAPP_APP_PATH") or _whatsapp_default_path).strip()
+# WhatsApp Web (Playwright): profile dir and browser; same first-login flow as Suno/X/Instagram
+WHATSAPP_WEB_URL = (os.environ.get("WHATSAPP_WEB_URL") or "https://web.whatsapp.com").strip().rstrip("/")
+WHATSAPP_WEB_PROFILE_DIR = os.environ.get(
+    "WHATSAPP_WEB_PROFILE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "whatsapp_web_profile"),
+).strip()
+WHATSAPP_WEB_BROWSER_CHANNEL = (os.environ.get("WHATSAPP_WEB_BROWSER_CHANNEL") or "chrome").strip().lower()
+WHATSAPP_WEB_BROWSER_PATH = (os.environ.get("WHATSAPP_WEB_BROWSER_PATH") or "").strip()
 FACEBOOK_PROFILE_URL = (os.environ.get("FACEBOOK_PROFILE_URL") or "https://www.facebook.com/solonaras").strip()
 FACEBOOK_HOME_URL = (os.environ.get("FACEBOOK_HOME_URL") or "https://www.facebook.com/").strip()
 FACEBOOK_PROFILE_DIR = os.environ.get(
@@ -237,6 +239,12 @@ _yt_bootstrap_running = False
 _ig_dm_lock = threading.Lock()
 _ig_bootstrap_lock = threading.Lock()
 _ig_bootstrap_running = False
+_wa_web_lock = threading.Lock()
+_wa_web_bootstrap_lock = threading.Lock()
+_wa_web_bootstrap_running = False
+# Persist WhatsApp Web browser so the window stays open after !call / !msg
+_wa_web_context = None
+_wa_web_playwright = None
 
 
 def _collect_legacy_scopes_for_linked_user() -> list[str]:
@@ -3681,6 +3689,208 @@ def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tu
             pass
 
 
+def _whatsapp_web_bootstrap_marker_path() -> str:
+    return os.path.join(WHATSAPP_WEB_PROFILE_DIR, ".login_ready")
+
+
+def _is_whatsapp_web_bootstrap_done() -> bool:
+    return os.path.isfile(_whatsapp_web_bootstrap_marker_path())
+
+
+def _mark_whatsapp_web_bootstrap_done() -> None:
+    try:
+        os.makedirs(WHATSAPP_WEB_PROFILE_DIR, exist_ok=True)
+        with open(_whatsapp_web_bootstrap_marker_path(), "w", encoding="utf-8") as f:
+            f.write("ready")
+    except Exception:
+        pass
+
+
+def _launch_whatsapp_web_context(playwright):
+    """Launch Playwright persistent context for WhatsApp Web."""
+    opts = {
+        "user_data_dir": WHATSAPP_WEB_PROFILE_DIR,
+        "headless": False,
+        "viewport": {"width": 1280, "height": 900},
+        "ignore_default_args": ["--enable-automation"],
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ],
+    }
+    if WHATSAPP_WEB_BROWSER_PATH and os.path.isfile(WHATSAPP_WEB_BROWSER_PATH):
+        opts["executable_path"] = WHATSAPP_WEB_BROWSER_PATH
+    elif WHATSAPP_WEB_BROWSER_CHANNEL in ("chrome", "msedge", "chrome-beta", "msedge-beta", "msedge-dev", "chromium"):
+        opts["channel"] = WHATSAPP_WEB_BROWSER_CHANNEL
+    return playwright.chromium.launch_persistent_context(**opts)
+
+
+def _start_whatsapp_web_first_login_window() -> tuple[bool, str]:
+    """First-run: open WhatsApp Web and keep browser open until user scans QR (or is already logged in)."""
+    global _wa_web_bootstrap_running
+    with _wa_web_bootstrap_lock:
+        if _wa_web_bootstrap_running:
+            return False, "WhatsApp Web login window is already open. Scan the QR code or close the window, then try again."
+        _wa_web_bootstrap_running = True
+
+    def _run():
+        global _wa_web_bootstrap_running
+        context = None
+        opened = False
+        try:
+            from playwright.sync_api import sync_playwright
+            os.makedirs(WHATSAPP_WEB_PROFILE_DIR, exist_ok=True)
+            with sync_playwright() as p:
+                context = _launch_whatsapp_web_context(p)
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(WHATSAPP_WEB_URL, wait_until="domcontentloaded", timeout=90000)
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                opened = True
+                while True:
+                    try:
+                        if not context.pages:
+                            break
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        break
+        except Exception as e:
+            print(f"WhatsApp Web first-login error: {e}", flush=True)
+        finally:
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            if opened:
+                _mark_whatsapp_web_bootstrap_done()
+            with _wa_web_bootstrap_lock:
+                _wa_web_bootstrap_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True, (
+        "Opening WhatsApp Web. Scan the QR code with your phone if needed. "
+        "When you're logged in, close the browser window. Next time Luna will use this session for !call / !msg."
+    )
+
+
+def _get_or_create_wa_web_context():
+    """Get existing WhatsApp Web browser context (window stays open) or create a new one. Returns (context, page, is_new)."""
+    global _wa_web_context, _wa_web_playwright
+    try:
+        if _wa_web_context is not None:
+            try:
+                pages = _wa_web_context.pages
+                if pages and not pages[0].is_closed():
+                    return _wa_web_context, pages[0], False
+            except Exception:
+                pass
+            _wa_web_context = None
+            _wa_web_playwright = None
+    except Exception:
+        pass
+    from playwright.sync_api import sync_playwright
+    p = sync_playwright().start()
+    _wa_web_playwright = p
+    os.makedirs(WHATSAPP_WEB_PROFILE_DIR, exist_ok=True)
+    _wa_web_context = _launch_whatsapp_web_context(p)
+    page = _wa_web_context.pages[0] if _wa_web_context.pages else _wa_web_context.new_page()
+    return _wa_web_context, page, True
+
+
+def _run_whatsapp_web_open_contact(contact_name: str) -> tuple[bool, str]:
+    """Open WhatsApp Web, ensure logged in, search for contact, open chat. Leaves browser window open."""
+    contact_name = (contact_name or "").strip()
+    if not contact_name:
+        return False, "Please provide a contact name (e.g. !msg Marios)."
+    with _wa_web_lock:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return False, "Playwright is not installed. Run: pip install playwright && playwright install chromium"
+        if not _is_whatsapp_web_bootstrap_done():
+            ok, msg = _start_whatsapp_web_first_login_window()
+            return False, msg + " Then run !call or !msg again."
+        try:
+            context, page, is_new = _get_or_create_wa_web_context()
+            if is_new:
+                page.goto(WHATSAPP_WEB_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+            else:
+                page.goto(WHATSAPP_WEB_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(1500)
+            qr = page.locator('canvas[aria-label*="QR"]').first
+            try:
+                if qr.count() and qr.is_visible():
+                    _start_whatsapp_web_first_login_window()
+                    return False, "WhatsApp Web session expired. Luna opened the login window — scan the QR code, then try !call again."
+            except Exception:
+                pass
+            search_selectors = [
+                '[data-tab="3"]',
+                '[aria-label="Search input textbox"]',
+                '[aria-label="Search name or number"]',
+                'div[contenteditable="true"][data-tab="3"]',
+            ]
+            search_box = None
+            for sel in search_selectors:
+                loc = page.locator(sel).first
+                try:
+                    if loc.count() and loc.is_visible():
+                        search_box = loc
+                        break
+                except Exception:
+                    continue
+            if not search_box:
+                return False, "Could not find the search box on WhatsApp Web. Try logging in again (close and run !call again)."
+            search_box.click()
+            page.wait_for_timeout(400)
+            search_box.fill("")
+            page.wait_for_timeout(200)
+            search_box.press_sequentially(contact_name, delay=50)
+            page.wait_for_timeout(2000)
+            for sel in [
+                f'[role="listitem"]:has-text("{contact_name}")',
+                f'div[data-testid="cell-frame-container"]:has-text("{contact_name}")',
+                f'span[dir="auto"]:has-text("{contact_name}")',
+            ]:
+                try:
+                    row = page.locator(sel).first
+                    if row.count() and row.is_visible():
+                        row.click()
+                        break
+                except Exception:
+                    continue
+            else:
+                try:
+                    page.get_by_text(contact_name, exact=False).first.click()
+                except Exception:
+                    pass
+            page.wait_for_timeout(800)
+            return True, f"Opened chat with **{contact_name}**. Window left open."
+        except Exception as e:
+            err = (str(e) or "unknown")[:200]
+            return False, f"WhatsApp Web error: {err}"
+
+
+def _run_whatsapp_web_call(contact_name: str) -> tuple[bool, str]:
+    """WhatsApp Web doesn't support voice calls (prompts desktop app). Just open the chat like !msg."""
+    ok, msg = _run_whatsapp_web_open_contact(contact_name)
+    if not ok:
+        return ok, msg
+    return True, f"Opened chat with **{contact_name}**. Voice calls need the WhatsApp desktop app — use it from there. Window left open."
+
+
+def _run_whatsapp_web_msg(contact_name: str) -> tuple[bool, str]:
+    """Open WhatsApp Web and open chat with contact (ready to type)."""
+    return _run_whatsapp_web_open_contact(contact_name)
+
+
 def _can_use_whatsapp_discord(author_id: int) -> bool:
     """Allow WhatsApp call/msg automation on Discord only for linked user or admin."""
     if _discord_admin_id_int is not None and author_id == _discord_admin_id_int:
@@ -3688,219 +3898,6 @@ def _can_use_whatsapp_discord(author_id: int) -> bool:
     if _linked_discord_id_int is not None and author_id == _linked_discord_id_int:
         return True
     return False
-
-
-def _get_whatsapp_exe_path() -> str | None:
-    """Return path to WhatsApp.exe (Windows). Tries WHATSAPP_APP_PATH then common install locations."""
-    if sys.platform != "win32":
-        return None
-    if WHATSAPP_APP_PATH and os.path.isfile(WHATSAPP_APP_PATH):
-        return WHATSAPP_APP_PATH
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
-    if local_app_data:
-        default = os.path.join(local_app_data, "WhatsApp", "WhatsApp.exe")
-        if os.path.isfile(default):
-            return default
-    return WHATSAPP_APP_PATH or (local_app_data and os.path.join(local_app_data, "WhatsApp", "WhatsApp.exe")) or None
-
-
-def _launch_whatsapp_via_start_menu() -> bool:
-    """Open Start menu, search for WhatsApp, and click to launch (Windows). Works even when exe path is unknown."""
-    if sys.platform != "win32":
-        return False
-    try:
-        import pyautogui
-    except ImportError:
-        return False
-    try:
-        # Win key opens Start; on Win10/11 focus is in search, so we can type
-        pyautogui.press("win")
-        time.sleep(0.6)
-        pyautogui.write("whatsapp", interval=0.06)
-        time.sleep(1.2)
-        pyautogui.press("enter")
-        time.sleep(5)
-        return True
-    except Exception:
-        return False
-
-
-def _launch_whatsapp_desktop_if_needed() -> bool:
-    """Start WhatsApp Desktop if not running (Windows). Tries existing window, exe path, then Start menu search."""
-    if sys.platform != "win32":
-        return False
-    # 1) Already running on any monitor?
-    try:
-        from pywinauto import Application
-        app = Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=2)
-        if app.windows():
-            return True
-    except Exception:
-        pass
-    # 2) Launch via exe path if we have it
-    path = _get_whatsapp_exe_path()
-    if path and os.path.isfile(path):
-        try:
-            subprocess.Popen([path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(5)
-            try:
-                Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=5)
-                return True
-            except Exception:
-                pass
-        except Exception:
-            pass
-    # 3) Fallback: Start menu — open Start, search "whatsapp", press Enter
-    if _launch_whatsapp_via_start_menu():
-        try:
-            Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=12)
-            return True
-        except Exception:
-            return True  # we launched something; user may need to wait a bit
-    return False
-
-
-def _run_whatsapp_desktop_open_contact(contact_name: str) -> tuple[bool, str]:
-    """Open WhatsApp Desktop, search for contact, select from list (opens chat). Windows only."""
-    if sys.platform != "win32":
-        return False, "WhatsApp automation is only supported on Windows."
-    contact_name = (contact_name or "").strip()
-    if not contact_name:
-        return False, "Please provide a contact name (e.g. !msg Marios)."
-    try:
-        from pywinauto import Application
-    except ImportError:
-        return False, "pywinauto is not installed. Run: pip install pywinauto"
-    if not _launch_whatsapp_desktop_if_needed():
-        return False, (
-            "Could not start or find WhatsApp. "
-            "Luna tried: (1) existing window, (2) launching via exe path, (3) Start menu → search 'whatsapp' → Enter. "
-            "Install WhatsApp Desktop, or set WHATSAPP_APP_PATH in .env to your WhatsApp.exe path."
-        )
-    win = None
-    try:
-        app = Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=12)
-        win = app.window(title_re=r".*WhatsApp.*")
-    except Exception:
-        try:
-            from pywinauto import Desktop
-            desktop = Desktop(backend="uia")
-            for w in desktop.windows():
-                try:
-                    t = (w.window_text() or "")
-                    if "WhatsApp" in t:
-                        win = w
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    if not win:
-        return False, "WhatsApp is open but Luna could not attach to it. Focus the WhatsApp window and try !call again."
-    try:
-        win.set_focus()
-        time.sleep(0.5)
-        win.type_keys("^f")
-        time.sleep(0.4)
-        win.type_keys(contact_name, with_spaces=True)
-        time.sleep(1.2)
-        win.type_keys("{ENTER}")
-        time.sleep(0.8)
-        return True, f"Opened chat with **{contact_name}**."
-    except Exception as e:
-        err = (str(e) or "unknown")[:180]
-        return False, f"WhatsApp automation error: {err}"
-
-
-def _run_whatsapp_desktop_call(contact_name: str) -> tuple[bool, str]:
-    """Open contact in WhatsApp Desktop, click Call (top right), then click Voice in the dropdown."""
-    ok, msg = _run_whatsapp_desktop_open_contact(contact_name)
-    if not ok:
-        return ok, msg
-    if sys.platform != "win32":
-        return True, msg
-    try:
-        from pywinauto import Application
-        from pywinauto import Desktop
-        import pyautogui
-        win = None
-        try:
-            app = Application(backend="uia").connect(title_re=r".*WhatsApp.*", timeout=8)
-            win = app.window(title_re=r".*WhatsApp.*")
-        except Exception:
-            try:
-                desktop = Desktop(backend="uia")
-                for w in desktop.windows():
-                    try:
-                        if "WhatsApp" in (w.window_text() or ""):
-                            win = w
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        if not win:
-            return True, f"Opened **{contact_name}**. Luna could not find the WhatsApp window for the call button. Tap Call then Voice manually."
-        win.set_focus()
-        time.sleep(0.5)
-        rect = win.rectangle()
-        call_clicked = False
-        # Step 1: Click the Call button (top right, next to search) to open the dropdown
-        for name in ("Call", "Voice call", "Phone"):
-            pattern = f".*{re.escape(name)}.*"
-            for ctrl_type in ("Button", "Hyperlink", "MenuItem", "Text", None):
-                try:
-                    if ctrl_type:
-                        btn = win.child_window(title_re=pattern, control_type=ctrl_type)
-                    else:
-                        btn = win.child_window(title_re=pattern)
-                    if btn.exists(timeout=0.8) and btn.is_enabled():
-                        btn.click()
-                        call_clicked = True
-                        break
-                except Exception:
-                    continue
-            if call_clicked:
-                break
-        if not call_clicked and rect.width() > 100 and rect.height() > 100:
-            pyautogui.click(rect.right - 180, rect.top + 45)
-            call_clicked = True
-        if not call_clicked:
-            return True, f"Opened **{contact_name}**. Could not find Call button; tap Call then Voice."
-        time.sleep(0.7)
-        # Step 2: Click the "Voice" option in the dropdown
-        voice_clicked = False
-        for name in ("Voice", "Voice call"):
-            pattern = f".*{re.escape(name)}.*"
-            for ctrl_type in ("Button", "MenuItem", "Hyperlink", "Text", None):
-                try:
-                    if ctrl_type:
-                        btn = win.child_window(title_re=pattern, control_type=ctrl_type)
-                    else:
-                        btn = win.child_window(title_re=pattern)
-                    if btn.exists(timeout=0.8) and btn.is_enabled():
-                        btn.click()
-                        voice_clicked = True
-                        break
-                except Exception:
-                    continue
-            if voice_clicked:
-                break
-        if not voice_clicked and rect.width() > 100 and rect.height() > 100:
-            # Voice is the first item in the dropdown, below the Call button
-            pyautogui.click(rect.right - 180, rect.top + 95)
-            voice_clicked = True
-        time.sleep(0.3)
-        if voice_clicked:
-            return True, f"Started a voice call with **{contact_name}**."
-        return True, f"Opened Call menu for **{contact_name}**. Tap Voice to start the call."
-    except Exception as e:
-        return True, f"Opened **{contact_name}**. Tap Call then Voice to start the call. ({e})"
-
-
-def _run_whatsapp_desktop_msg(contact_name: str) -> tuple[bool, str]:
-    """Open WhatsApp Desktop and open chat with contact (ready to type message)."""
-    return _run_whatsapp_desktop_open_contact(contact_name)
 
 
 def _stream_tts_chunks(text: str):
@@ -4138,8 +4135,8 @@ LUNA_COMMANDS_REPLY = (
     "• !remember / !always_remember — store memories\n"
     "• !profile — view or set your profile\n"
     "• !join / !leave — voice; !play / !pause / !skip / !stop / !queue — music\n"
-    "• !call <contact> — WhatsApp: open contact and start call (Windows)\n"
-    "• !msg <contact> — WhatsApp: open chat with contact (Windows)"
+    "• !call <contact> — WhatsApp Web: open chat with contact (voice calls need desktop app)\n"
+    "• !msg <contact> — WhatsApp Web: open chat with contact"
 )
 
 # Trigger phrases for command/help intent (natural language → template reply)
@@ -4279,12 +4276,12 @@ def _handle_web_file_command(msg: str) -> str | None:
     if cmd == "!call":
         if not args:
             return "Usage: !call <contact name or number> (e.g. !call Marios or !call +357 96 724268)"
-        ok, result = _run_whatsapp_desktop_call(args)
+        ok, result = _run_whatsapp_web_call(args)
         return f"✅ {result}" if ok else f"❌ {result}"
     if cmd == "!msg":
         if not args:
             return "Usage: !msg <contact name or number>"
-        ok, result = _run_whatsapp_desktop_msg(args)
+        ok, result = _run_whatsapp_web_msg(args)
         return f"✅ {result}" if ok else f"❌ {result}"
     return None
 
@@ -5246,7 +5243,7 @@ async def cmd_stoptts(ctx: commands.Context):
 
 @bot.command(name="call")
 async def cmd_whatsapp_call(ctx: commands.Context, *, contact: str = ""):
-    """Open WhatsApp Desktop, select contact, and start a call (phone icon). Usage: !call <contact name>"""
+    """Open WhatsApp Web and open chat with contact (calls require desktop app). Usage: !call <contact name>"""
     if not _can_use_whatsapp_discord(ctx.author.id):
         await ctx.reply("Only the linked user or admin can use WhatsApp automation.")
         return
@@ -5255,13 +5252,13 @@ async def cmd_whatsapp_call(ctx: commands.Context, *, contact: str = ""):
         await ctx.reply("Usage: `!call <contact name>` (e.g. !call Marios)")
         return
     await ctx.reply(f"Opening WhatsApp and starting a call with **{contact}**…")
-    ok, result = await asyncio.to_thread(_run_whatsapp_desktop_call, contact)
+    ok, result = await asyncio.to_thread(_run_whatsapp_web_call, contact)
     await ctx.reply(result if ok else f"❌ {result}")
 
 
 @bot.command(name="msg")
 async def cmd_whatsapp_msg(ctx: commands.Context, *, contact: str = ""):
-    """Open WhatsApp Desktop and open chat with contact. Usage: !msg <contact name>"""
+    """Open WhatsApp Web and open chat with contact. Usage: !msg <contact name>"""
     if not _can_use_whatsapp_discord(ctx.author.id):
         await ctx.reply("Only the linked user or admin can use WhatsApp automation.")
         return
@@ -5270,7 +5267,7 @@ async def cmd_whatsapp_msg(ctx: commands.Context, *, contact: str = ""):
         await ctx.reply("Usage: `!msg <contact name>` (e.g. !msg Marios)")
         return
     await ctx.reply(f"Opening WhatsApp and chat with **{contact}**…")
-    ok, result = await asyncio.to_thread(_run_whatsapp_desktop_msg, contact)
+    ok, result = await asyncio.to_thread(_run_whatsapp_web_msg, contact)
     await ctx.reply(result if ok else f"❌ {result}")
 
 
