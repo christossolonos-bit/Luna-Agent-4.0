@@ -1751,24 +1751,38 @@ def _run_suno_create(description: str) -> tuple[bool, str]:
             page.keyboard.press("Backspace")
             page.keyboard.type(desc, delay=22)
 
+            # Try multiple strategies in one session: different selectors and waits.
+            _waits = (1200, 1500, 0) if _should_prefer_longer_waits("suno") else (0, 1200, 1500)
             clicked = False
-            for bsel in (
-                "button:has-text('Create')",
-                "button:has-text('Generate')",
-                "[role='button']:has-text('Create')",
-                "[role='button']:has-text('Generate')",
-            ):
-                btn = page.locator(bsel).first
+            for extra_wait in _waits:
+                page.wait_for_timeout(extra_wait)
+                for bsel in (
+                    "button:has-text('Create')",
+                    "button:has-text('Generate')",
+                    "[role='button']:has-text('Create')",
+                    "[role='button']:has-text('Generate')",
+                    "button:has-text('Create')",
+                    "button:has-text('Generate')",
+                ):
+                    btn = page.locator(bsel).first
+                    try:
+                        if btn.count() and btn.is_visible():
+                            btn.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if clicked:
+                    break
                 try:
-                    if btn.count() and btn.is_visible():
-                        btn.click()
-                        clicked = True
-                        break
+                    page.locator("button:has-text('Create'), button:has-text('Generate')").first.click()
+                    clicked = True
+                    break
                 except Exception:
-                    continue
+                    pass
 
             if not clicked:
-                return False, "I entered your prompt on Suno, but couldn't find the Create button."
+                return False, "I entered your prompt on Suno, but couldn't find the Create button (tried several strategies)."
 
             page.wait_for_timeout(2500)
             return True, f"Opened Suno, typed: \"{_suno_preview_text(desc, 260)}\", then clicked Create."
@@ -2209,19 +2223,25 @@ def _run_x_share_random_song() -> tuple[bool, str]:
                     return False, "I couldn't type into the X post box. The compose overlay appears to be blocking input."
                 _resolve_x_profile_popup()
 
-                post_btn = page.locator("div[role='dialog'] button[data-testid='tweetButtonInline']").first
-                if not (post_btn.count() and post_btn.is_visible()):
-                    post_btn = page.locator("div[role='dialog'] button[data-testid='tweetButton']").first
-                if not (post_btn.count() and post_btn.is_visible()):
-                    post_btn = page.locator("div[role='dialog'] button:has-text('Post')").first
-                if not (post_btn.count() and post_btn.is_visible()):
-                    post_btn = page.locator("button:has-text('Post')").first
-                if not (post_btn.count() and post_btn.is_visible()):
-                    return False, "I typed the message, but couldn't find the Post button."
+                def _find_x_post_btn():
+                    for sel in (
+                        "div[role='dialog'] button[data-testid='tweetButtonInline']",
+                        "div[role='dialog'] button[data-testid='tweetButton']",
+                        "div[role='dialog'] button:has-text('Post')",
+                        "button:has-text('Post')",
+                        "button[data-testid='tweetButton']",
+                    ):
+                        loc = page.locator(sel).first
+                        try:
+                            if loc.count() and loc.is_visible():
+                                return loc
+                        except Exception:
+                            continue
+                    return None
 
                 def _is_enabled(btn):
                     try:
-                        if not btn.count() or not btn.is_visible():
+                        if btn is None or not btn.count() or not btn.is_visible():
                             return False
                         if btn.is_disabled():
                             return False
@@ -2230,28 +2250,39 @@ def _run_x_share_random_song() -> tuple[bool, str]:
                     except Exception:
                         return False
 
-                # Wait for X to enable Post after typing.
-                deadline = time.time() + 8
-                while time.time() < deadline and not _is_enabled(post_btn):
-                    page.wait_for_timeout(250)
-
-                if not _is_enabled(post_btn):
-                    # Fallback: retype a shorter plain message in case rich text input failed to register.
-                    short_message = f"{song_title[:60].strip()} {song_url}".strip()[:220]
-                    if not _set_x_text(textbox, short_message, delay_ms=14):
-                        return False, "I couldn't re-focus and retype into the X post box for retry."
-                    _resolve_x_profile_popup()
-                    deadline2 = time.time() + 6
-                    while time.time() < deadline2 and not _is_enabled(post_btn):
+                x_posted = False
+                _x_waits = (1500, 2000, 0) if _should_prefer_longer_waits("share_x") else (0, 1500, 2000)
+                for extra_wait in _x_waits:
+                    page.wait_for_timeout(extra_wait)
+                    post_btn = _find_x_post_btn()
+                    if post_btn is None:
+                        continue
+                    deadline = time.time() + 8
+                    while time.time() < deadline and not _is_enabled(post_btn):
                         page.wait_for_timeout(250)
-
-                if not _is_enabled(post_btn):
-                    return False, "I typed the post, but X kept the Post button disabled. Please try once manually in that same compose box, then run again."
-
-                try:
-                    post_btn.click(timeout=5000)
-                except Exception:
-                    post_btn.click(timeout=5000, force=True)
+                    if not _is_enabled(post_btn) and extra_wait == 0:
+                        short_message = f"{song_title[:60].strip()} {song_url}".strip()[:220]
+                        if _set_x_text(textbox, short_message, delay_ms=14):
+                            _resolve_x_profile_popup()
+                            for _ in range(24):
+                                page.wait_for_timeout(250)
+                                if _is_enabled(post_btn):
+                                    break
+                    if not _is_enabled(post_btn):
+                        continue
+                    try:
+                        post_btn.click(timeout=5000)
+                        x_posted = True
+                        break
+                    except Exception:
+                        try:
+                            post_btn.click(timeout=5000, force=True)
+                            x_posted = True
+                            break
+                        except Exception:
+                            pass
+                if not x_posted:
+                    return False, "I typed the message, but couldn't find or click the X Post button (tried several strategies)."
                 page.wait_for_timeout(3000)
                 return True, f"Shared to X ({X_PROFILE_URL}): \"{song_title}\" — {song_url}"
         except Exception as e:
@@ -2587,41 +2618,107 @@ def _run_facebook_share_random_song() -> tuple[bool, str]:
                         page.wait_for_timeout(250)
                     if not next_clicked:
                         return False, "I typed the Facebook post, but the Next button stayed disabled."
-                    page.wait_for_timeout(900)
+                    page.wait_for_timeout(2500)
 
-                post_btn = _find_visible_button(
-                    (
-                        "div[role='dialog'] div[aria-label='Post']",
-                        "div[role='dialog'] [role='button']:has-text('Post')",
-                        "[role='button'][aria-label='Post']",
-                        "[data-testid='react-composer-post-button']",
-                        "button:has-text('Post')",
-                    )
-                )
-                if post_btn is None:
-                    return False, "I typed the Facebook post, but couldn't find the Post button."
-
-                post_clicked = False
-                post_deadline = time.time() + 8
-                while time.time() < post_deadline:
+                # Post settings dialog: try multiple strategies in one session until one works (no extra browser opens).
+                def _post_dialog_still_visible() -> bool:
                     try:
-                        disabled = False
-                        if hasattr(post_btn, "is_disabled") and post_btn.is_disabled():
-                            disabled = True
-                        aria_dis = (post_btn.get_attribute("aria-disabled") or "").lower().strip()
-                        if aria_dis in ("true", "1"):
-                            disabled = True
-                        if not disabled:
-                            post_btn.click()
-                            post_clicked = True
-                            break
+                        d = page.locator("div[role='dialog']").first
+                        return d.count() > 0 and d.is_visible()
+                    except Exception:
+                        return True
+
+                def _find_post_button(use_last: bool = True):
+                    for sel in (
+                        "div[role='dialog']:has-text('Post settings') button:has-text('Post')",
+                        "div[role='dialog']:has-text('Save') button:has-text('Post')",
+                        "div[role='dialog'] button:has-text('Post')",
+                        "div[role='dialog'] [role='button']:has-text('Post')",
+                        "[role='dialog'] button:has-text('Post')",
+                    ):
+                        loc = page.locator(sel).last if use_last else page.locator(sel).first
+                        try:
+                            if loc.count() and loc.is_visible():
+                                return loc
+                        except Exception:
+                            continue
+                    try:
+                        r = page.get_by_role("button", name="Post").last if use_last else page.get_by_role("button", name="Post").first
+                        if r.count() and r.is_visible():
+                            return r
                     except Exception:
                         pass
-                    page.wait_for_timeout(250)
-                if not post_clicked:
-                    return False, "I found Facebook Post, but it stayed disabled."
+                    return _find_visible_button(
+                        (
+                            "div[role='dialog'] div[aria-label='Post']",
+                            "[role='button'][aria-label='Post']",
+                            "[data-testid='react-composer-post-button']",
+                            "button:has-text('Post')",
+                        )
+                    )
 
-                page.wait_for_timeout(2800)
+                post_success = False
+                # Strategies: (extra_wait_ms, use_last_for_selectors, try_any_post_button)
+                _strategies = (
+                    (0, True, False),
+                    (2000, True, False),
+                    (2000, False, False),
+                    (1500, True, True),
+                    (1000, False, True),
+                )
+                if _should_prefer_longer_waits("share_facebook"):
+                    _strategies = ((2000, True, False), (2000, False, False), (1500, True, True), (1000, False, True), (0, True, False))
+                for extra_wait, use_last, try_any in _strategies:
+                    page.wait_for_timeout(extra_wait)
+                    post_btn = None
+                    for _ in range(10):
+                        if try_any:
+                            try:
+                                all_post = page.locator('button:has-text("Post"), [role="button"]:has-text("Post")')
+                                for i in range(min(all_post.count(), 5)):
+                                    b = all_post.nth(i)
+                                    if b.is_visible():
+                                        post_btn = b
+                                        break
+                            except Exception:
+                                pass
+                        else:
+                            post_btn = _find_post_button(use_last=use_last)
+                        if post_btn is not None:
+                            break
+                        page.wait_for_timeout(400)
+                    if post_btn is None:
+                        continue
+                    try:
+                        post_btn.scroll_into_view_if_needed()
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(300)
+                    clicked = False
+                    for _ in range(25):
+                        try:
+                            disabled = False
+                            if hasattr(post_btn, "is_disabled") and post_btn.is_disabled():
+                                disabled = True
+                            aria_dis = (post_btn.get_attribute("aria-disabled") or "").lower().strip()
+                            if aria_dis in ("true", "1"):
+                                disabled = True
+                            if not disabled:
+                                post_btn.click(force=True)
+                                clicked = True
+                                break
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(350)
+                    if not clicked:
+                        continue
+                    page.wait_for_timeout(2500)
+                    if not _post_dialog_still_visible():
+                        post_success = True
+                        break
+                if not post_success:
+                    return False, "I typed the Facebook post, but couldn't find or click the Post button in the Post settings dialog (tried several strategies)."
+                page.wait_for_timeout(500)
                 return True, f"Shared to Facebook ({FACEBOOK_PROFILE_URL}): \"{song_title}\" — {song_url}"
         except Exception as e:
             return False, f"Facebook share automation error: {e}"
@@ -3114,8 +3211,6 @@ def _run_youtube_comment(video_url: str) -> tuple[bool, str]:
                 return False
 
             found = _locate_comment_placeholder()
-            # Shorts UI may not expose the standard comment composer reliably.
-            # Fallback to normal watch page for robust comment posting.
             if not found and is_shorts:
                 try:
                     page.goto(watch_url, wait_until="domcontentloaded", timeout=90000)
@@ -3123,19 +3218,47 @@ def _run_youtube_comment(video_url: str) -> tuple[bool, str]:
                 except Exception:
                     pass
                 found = _locate_comment_placeholder()
+            if not found:
+                for _ in range(3):
+                    page.wait_for_timeout(1500)
+                    try:
+                        page.mouse.wheel(0, 800)
+                    except Exception:
+                        pass
+                    found = _locate_comment_placeholder()
+                    if found:
+                        break
 
             if not found:
-                return False, "I couldn't open the YouTube comment box (including Shorts fallback)."
+                return False, "I couldn't open the YouTube comment box (including Shorts fallback and retries)."
 
             placeholder = page.locator("ytd-comment-simplebox-renderer #simplebox-placeholder").first
-            try:
-                placeholder.click(timeout=3000, force=True)
-            except Exception:
-                return False, "I found comments but couldn't activate the comment editor."
+            placeholder_clicked = False
+            for _ in range(3):
+                try:
+                    placeholder.click(timeout=3000, force=True)
+                    placeholder_clicked = True
+                    break
+                except Exception:
+                    page.wait_for_timeout(600)
+            if not placeholder_clicked:
+                return False, "I found comments but couldn't activate the comment editor (tried several times)."
 
-            editor = page.locator("ytd-comment-simplebox-renderer #contenteditable-root[contenteditable='true']").first
-            if not (editor.count() and editor.is_visible()):
-                return False, "I couldn't find the editable YouTube comment field."
+            editor = None
+            for sel in (
+                "ytd-comment-simplebox-renderer #contenteditable-root[contenteditable='true']",
+                "ytd-comment-simplebox-renderer [contenteditable='true']",
+                "#contenteditable-root[contenteditable='true']",
+            ):
+                loc = page.locator(sel).first
+                try:
+                    if loc.count() and loc.is_visible():
+                        editor = loc
+                        break
+                except Exception:
+                    continue
+            if editor is None:
+                return False, "I couldn't find the editable YouTube comment field (tried several selectors)."
             try:
                 editor.click(timeout=2500, force=True)
                 page.keyboard.press("Control+A")
@@ -3145,15 +3268,9 @@ def _run_youtube_comment(video_url: str) -> tuple[bool, str]:
             except Exception as e:
                 return False, f"I couldn't type the YouTube comment: {e}"
 
-            submit_btn = page.locator("ytd-commentbox #submit-button button").first
-            if not (submit_btn.count() and submit_btn.is_visible()):
-                submit_btn = page.locator("ytd-commentbox #submit-button").first
-            if not (submit_btn.count() and submit_btn.is_visible()):
-                return False, "I typed the comment but couldn't find the YouTube Post button."
-
-            def _is_enabled(btn):
+            def _yt_submit_enabled(btn):
                 try:
-                    if not btn.count() or not btn.is_visible():
+                    if btn is None or not btn.count() or not btn.is_visible():
                         return False
                     if hasattr(btn, "is_disabled") and btn.is_disabled():
                         return False
@@ -3162,17 +3279,43 @@ def _run_youtube_comment(video_url: str) -> tuple[bool, str]:
                 except Exception:
                     return False
 
-            deadline = time.time() + 8
-            while time.time() < deadline and not _is_enabled(submit_btn):
-                page.wait_for_timeout(250)
+            submit_btn = None
+            for sel in (
+                "ytd-commentbox #submit-button button",
+                "ytd-commentbox #submit-button",
+                "#submit-button button",
+                "ytd-commentbox button[aria-label='Comment']",
+            ):
+                loc = page.locator(sel).first
+                try:
+                    if loc.count() and loc.is_visible():
+                        submit_btn = loc
+                        break
+                except Exception:
+                    continue
+            if submit_btn is None:
+                return False, "I typed the comment but couldn't find the YouTube Post button (tried several strategies)."
 
-            if not _is_enabled(submit_btn):
-                return False, "I typed the YouTube comment, but Post stayed disabled."
+            _yt_waits = (2000, 1500, 0) if _should_prefer_longer_waits("yt_comment") else (0, 2000, 1500)
+            for extra_wait in _yt_waits:
+                page.wait_for_timeout(extra_wait)
+                deadline = time.time() + 8
+                while time.time() < deadline and not _yt_submit_enabled(submit_btn):
+                    page.wait_for_timeout(250)
+                if not _yt_submit_enabled(submit_btn):
+                    continue
+                try:
+                    submit_btn.click(timeout=5000)
+                    break
+                except Exception:
+                    try:
+                        submit_btn.click(timeout=5000, force=True)
+                        break
+                    except Exception:
+                        pass
+            else:
+                return False, "I typed the YouTube comment, but Post stayed disabled (tried several waits)."
 
-            try:
-                submit_btn.click(timeout=5000)
-            except Exception:
-                submit_btn.click(timeout=5000, force=True)
             page.wait_for_timeout(2000)
             short_title = (title or video_id).strip()
             if len(short_title) > 90:
@@ -3359,30 +3502,37 @@ def _send_instagram_message_in_open_thread(page, dm_text: str) -> tuple[bool, st
         "div[role='textbox'][contenteditable='true']",
         "p[contenteditable='true']",
     )
-    wait_deadline = time.time() + 15
-    while time.time() < wait_deadline and editor is None:
-        if composer is not None:
-            for sel in editor_selectors:
-                loc = composer.locator(sel).first
-                try:
-                    if loc.count() and loc.is_visible():
-                        editor = loc
-                        break
-                except Exception:
-                    continue
-        if editor is None:
-            for sel in editor_selectors:
-                loc = page.locator(sel).last
-                try:
-                    if loc.count() and loc.is_visible():
-                        editor = loc
-                        break
-                except Exception:
-                    continue
-        if editor is None:
-            page.wait_for_timeout(350)
+    # Multi-strategy in one session: retry finding editor with extra waits.
+    if _should_prefer_longer_waits("ig_dm"):
+        page.wait_for_timeout(1500)
+    for attempt in range(3):
+        wait_deadline = time.time() + (12 if attempt == 0 else 6)
+        while time.time() < wait_deadline and editor is None:
+            if composer is not None:
+                for sel in editor_selectors:
+                    loc = composer.locator(sel).first
+                    try:
+                        if loc.count() and loc.is_visible():
+                            editor = loc
+                            break
+                    except Exception:
+                        continue
+            if editor is None:
+                for sel in editor_selectors:
+                    loc = page.locator(sel).last
+                    try:
+                        if loc.count() and loc.is_visible():
+                            editor = loc
+                            break
+                    except Exception:
+                        continue
+            if editor is None:
+                page.wait_for_timeout(350)
+        if editor is not None:
+            break
+        page.wait_for_timeout(1500)
     if editor is None:
-        return False, "I couldn't find the Instagram DM text box at the bottom."
+        return False, "I couldn't find the Instagram DM text box at the bottom (tried several times)."
 
     try:
         editor.scroll_into_view_if_needed(timeout=2500)
@@ -3390,7 +3540,6 @@ def _send_instagram_message_in_open_thread(page, dm_text: str) -> tuple[bool, st
         pass
     try:
         editor.click(timeout=4000, force=True)
-        # Type slower so the user can visibly watch the message being written.
         page.keyboard.type(dm_text, delay=26)
         page.wait_for_timeout(1100)
     except Exception as e:
@@ -3401,36 +3550,42 @@ def _send_instagram_message_in_open_thread(page, dm_text: str) -> tuple[bool, st
         "button[type='submit']",
         "button:has-text('Send')",
         "div[role='button']:has-text('Send')",
+        "[aria-label='Send']",
+        "button[type='submit']",
     )
-    if composer is not None:
-        for sel in send_selectors:
-            b = composer.locator(sel).last
+    for _ in range(2):
+        if composer is not None:
+            for sel in send_selectors:
+                b = composer.locator(sel).last
+                try:
+                    if b.count() and b.is_visible():
+                        b.click(timeout=3500, force=True)
+                        sent = True
+                        break
+                except Exception:
+                    continue
+        if not sent:
+            for sel in send_selectors:
+                b = page.locator(sel).last
+                try:
+                    if b.count() and b.is_visible():
+                        b.click(timeout=3500, force=True)
+                        sent = True
+                        break
+                except Exception:
+                    continue
+        if not sent:
             try:
-                if b.count() and b.is_visible():
-                    b.click(timeout=3500, force=True)
-                    sent = True
-                    break
+                page.keyboard.press("Enter")
+                sent = True
             except Exception:
-                continue
-    if not sent:
-        for sel in send_selectors:
-            b = page.locator(sel).last
-            try:
-                if b.count() and b.is_visible():
-                    b.click(timeout=3500, force=True)
-                    sent = True
-                    break
-            except Exception:
-                continue
-    if not sent:
-        try:
-            page.keyboard.press("Enter")
-            sent = True
-        except Exception:
-            pass
+                pass
+        if sent:
+            break
+        page.wait_for_timeout(1000)
 
     if not sent:
-        return False, "I typed the Instagram DM but couldn't press Send on the right side."
+        return False, "I typed the Instagram DM but couldn't press Send (tried several strategies)."
     page.wait_for_timeout(1500)
     return True, "sent"
 
@@ -3587,23 +3742,29 @@ def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tu
                     except Exception:
                         continue
 
-                # 2) Use inbox search exactly like your screenshot flow.
+                # 2) Use inbox search — multi-strategy: retry with extra wait and alternate selectors.
                 search_box = None
-                for sel in (
-                    "aside input[placeholder='Search']",
-                    "aside input[aria-label='Search input']",
-                    "input[placeholder='Search']",
-                    "input[aria-label='Search input']",
-                ):
-                    loc = page.locator(sel).first
-                    try:
-                        if loc.count() and loc.is_visible():
-                            search_box = loc
-                            break
-                    except Exception:
-                        continue
+                _ig_search_waits = (1500, 1000, 0) if _should_prefer_longer_waits("ig_dm") else (0, 1500, 1000)
+                for wait_ms in _ig_search_waits:
+                    page.wait_for_timeout(wait_ms)
+                    for sel in (
+                        "aside input[placeholder='Search']",
+                        "aside input[aria-label='Search input']",
+                        "input[placeholder='Search']",
+                        "input[aria-label='Search input']",
+                        "input[placeholder*='Search']",
+                    ):
+                        loc = page.locator(sel).first
+                        try:
+                            if loc.count() and loc.is_visible():
+                                search_box = loc
+                                break
+                        except Exception:
+                            continue
+                    if search_box is not None:
+                        break
                 if search_box is None:
-                    return False, "I couldn't find the Instagram inbox search box."
+                    return False, "I couldn't find the Instagram inbox search box (tried several strategies)."
 
                 try:
                     search_box.click(timeout=3000, force=True)
@@ -3614,74 +3775,95 @@ def _run_instagram_dm_by_username(username: str, custom_message: str = "") -> tu
                 except Exception as e:
                     return False, f"I couldn't type in Instagram inbox search: {e}"
 
-                for sel in (
-                    f"aside a[href*='/direct/t/']:has-text('{target}')",
-                    f"aside div[role='button']:has-text('{target}')",
-                    f"div[role='dialog'] [role='button']:has-text('{target}')",
-                    f"main a[href*='/direct/t/']:has-text('{target}')",
-                ):
-                    loc = page.locator(sel).first
-                    try:
-                        if loc.count() and loc.is_visible():
-                            loc.click(timeout=4000, force=True)
-                            page.wait_for_timeout(900)
-                            return True, "thread-opened-search"
-                    except Exception:
-                        continue
-                return False, f"I couldn't find @{target} in Instagram inbox results."
+                user_found = False
+                for wait_after in (900, 1500, 1200):
+                    page.wait_for_timeout(wait_after)
+                    for sel in (
+                        f"aside a[href*='/direct/t/']:has-text('{target}')",
+                        f"aside div[role='button']:has-text('{target}')",
+                        f"div[role='dialog'] [role='button']:has-text('{target}')",
+                        f"main a[href*='/direct/t/']:has-text('{target}')",
+                        f"a[href*='/direct/']:has-text('{target}')",
+                        f"[role='button']:has-text('{target}')",
+                    ):
+                        loc = page.locator(sel).first
+                        try:
+                            if loc.count() and loc.is_visible():
+                                loc.click(timeout=4000, force=True)
+                                page.wait_for_timeout(900)
+                                user_found = True
+                                break
+                        except Exception:
+                            continue
+                    if user_found:
+                        break
+                if not user_found:
+                    return False, f"I couldn't find @{target} in Instagram inbox results (tried several strategies)."
+                return True, "thread-opened-search"
 
             ok_thread, thread_msg = _open_thread_in_inbox()
             if not ok_thread:
                 return False, thread_msg
 
             editor = None
-            for sel in (
-                "textarea[placeholder='Message...']",
-                "textarea[aria-label='Message']",
-                "div[role='textbox'][contenteditable='true']",
-                "div[contenteditable='true'][aria-label='Message']",
-                "div[aria-label='Message'][contenteditable='true']",
-            ):
-                loc = page.locator(sel).first
-                try:
-                    if loc.count() and loc.is_visible():
-                        editor = loc
-                        break
-                except Exception:
-                    continue
+            _ig_editor_waits = (1200, 1000, 0) if _should_prefer_longer_waits("ig_dm") else (0, 1200, 1000)
+            for wait_ms in _ig_editor_waits:
+                page.wait_for_timeout(wait_ms)
+                for sel in (
+                    "textarea[placeholder='Message...']",
+                    "textarea[aria-label='Message']",
+                    "div[role='textbox'][contenteditable='true']",
+                    "div[contenteditable='true'][aria-label='Message']",
+                    "div[aria-label='Message'][contenteditable='true']",
+                    "textarea[placeholder*='Message']",
+                ):
+                    loc = page.locator(sel).first
+                    try:
+                        if loc.count() and loc.is_visible():
+                            editor = loc
+                            break
+                    except Exception:
+                        continue
+                if editor is not None:
+                    break
             if editor is None:
-                return False, "I couldn't find the Instagram DM text box."
+                return False, "I couldn't find the Instagram DM text box (tried several strategies)."
 
             try:
                 editor.click(timeout=4000, force=True)
-                # Type slower so the user can visibly watch the message being written.
                 page.keyboard.type(dm_text, delay=26)
                 page.wait_for_timeout(1100)
             except Exception as e:
                 return False, f"I couldn't type the Instagram DM: {e}"
 
             sent = False
-            for sel in (
-                "button:has-text('Send')",
-                "div[role='button']:has-text('Send')",
-            ):
-                b = page.locator(sel).first
-                try:
-                    if b.count() and b.is_visible():
-                        b.click(timeout=3000, force=True)
+            for _ in range(2):
+                for sel in (
+                    "button:has-text('Send')",
+                    "div[role='button']:has-text('Send')",
+                    "button[type='submit']",
+                    "[aria-label='Send']",
+                ):
+                    b = page.locator(sel).first
+                    try:
+                        if b.count() and b.is_visible():
+                            b.click(timeout=3000, force=True)
+                            sent = True
+                            break
+                    except Exception:
+                        continue
+                if not sent:
+                    try:
+                        page.keyboard.press("Enter")
                         sent = True
-                        break
-                except Exception:
-                    continue
-            if not sent:
-                try:
-                    page.keyboard.press("Enter")
-                    sent = True
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                if sent:
+                    break
+                page.wait_for_timeout(800)
 
             if not sent:
-                return False, "I typed the Instagram DM but couldn't send it."
+                return False, "I typed the Instagram DM but couldn't send it (tried several strategies)."
 
             page.wait_for_timeout(1500)
             return True, f"Instagram message sent to @{target}."
@@ -3895,50 +4077,70 @@ def _run_whatsapp_web_open_contact(contact_name: str, message_to_send: str | Non
                 '[aria-label="Search input textbox"]',
                 '[aria-label="Search name or number"]',
                 'div[contenteditable="true"][data-tab="3"]',
+                '[contenteditable="true"][data-tab="3"]',
+                'footer + div [contenteditable="true"]',
             ]
             search_box = None
-            for sel in search_selectors:
-                loc = page.locator(sel).first
-                try:
-                    if loc.count() and loc.is_visible():
-                        search_box = loc
-                        break
-                except Exception:
-                    continue
+            _wa_prefer = _should_prefer_longer_waits("msg") or _should_prefer_longer_waits("call")
+            _wa_search_waits = (1500, 1000, 0) if _wa_prefer else (0, 1500, 1000)
+            for wait_ms in _wa_search_waits:
+                page.wait_for_timeout(wait_ms)
+                for sel in search_selectors:
+                    loc = page.locator(sel).first
+                    try:
+                        if loc.count() and loc.is_visible():
+                            search_box = loc
+                            break
+                    except Exception:
+                        continue
+                if search_box:
+                    break
             if not search_box:
-                return False, "Could not find the search box on WhatsApp Web. Try logging in again (close and run !call again)."
+                return False, "Could not find the search box on WhatsApp Web (tried several strategies). Try logging in again."
             search_box.click()
             page.wait_for_timeout(400)
             search_box.fill("")
             page.wait_for_timeout(200)
             search_box.press_sequentially(contact_name, delay=50)
-            page.wait_for_timeout(2000)
-            for sel in [
-                f'[role="listitem"]:has-text("{contact_name}")',
-                f'div[data-testid="cell-frame-container"]:has-text("{contact_name}")',
-                f'span[dir="auto"]:has-text("{contact_name}")',
-            ]:
-                try:
-                    row = page.locator(sel).first
-                    if row.count() and row.is_visible():
-                        row.click()
-                        break
-                except Exception:
-                    continue
-            else:
+            contact_clicked = False
+            for wait_ms in (2000, 1500, 1000):
+                page.wait_for_timeout(wait_ms)
+                for sel in [
+                    f'[role="listitem"]:has-text("{contact_name}")',
+                    f'div[data-testid="cell-frame-container"]:has-text("{contact_name}")',
+                    f'span[dir="auto"]:has-text("{contact_name}")',
+                    f'[data-testid="cell-frame-container"]:has-text("{contact_name}")',
+                ]:
+                    try:
+                        row = page.locator(sel).first
+                        if row.count() and row.is_visible():
+                            row.click()
+                            contact_clicked = True
+                            break
+                    except Exception:
+                        continue
+                if contact_clicked:
+                    break
                 try:
                     page.get_by_text(contact_name, exact=False).first.click()
+                    contact_clicked = True
+                    break
                 except Exception:
                     pass
             page.wait_for_timeout(800)
             if message_to_send:
-                try:
-                    msg_input_selectors = [
-                        'div[contenteditable="true"][role="textbox"]',
-                        'footer [contenteditable="true"]',
-                        '[data-tab="10"]',
-                        'div[contenteditable="true"].selectable-text',
-                    ]
+                msg_input_selectors = [
+                    'div[contenteditable="true"][role="textbox"]',
+                    'footer [contenteditable="true"]',
+                    '[data-tab="10"]',
+                    'div[contenteditable="true"].selectable-text',
+                    'footer div[contenteditable="true"]',
+                    '[contenteditable="true"][data-tab="10"]',
+                ]
+                sent_ok = False
+                _wa_msg_waits = (1200, 800, 0) if _wa_prefer else (0, 1200, 800)
+                for wait_ms in _wa_msg_waits:
+                    page.wait_for_timeout(wait_ms)
                     msg_input = None
                     for sel in msg_input_selectors:
                         loc = page.locator(sel).first
@@ -3948,25 +4150,34 @@ def _run_whatsapp_web_open_contact(contact_name: str, message_to_send: str | Non
                                 break
                         except Exception:
                             continue
-                    if msg_input:
+                    if not msg_input:
+                        continue
+                    try:
                         msg_input.click()
                         page.wait_for_timeout(300)
                         msg_input.fill("")
                         page.wait_for_timeout(100)
                         msg_input.press_sequentially(message_to_send, delay=30)
                         page.wait_for_timeout(400)
-                        send_btn = page.locator('[data-testid="send"]').first
-                        if not send_btn.count() or not send_btn.is_visible():
-                            send_btn = page.locator('[data-icon="send"]').first
-                        if send_btn.count() and send_btn.is_visible():
-                            send_btn.click()
-                        else:
+                        for send_sel in ('[data-testid="send"]', '[data-icon="send"]', '[aria-label="Send"]'):
+                            send_btn = page.locator(send_sel).first
+                            try:
+                                if send_btn.count() and send_btn.is_visible():
+                                    send_btn.click()
+                                    sent_ok = True
+                                    break
+                            except Exception:
+                                continue
+                        if not sent_ok:
                             page.keyboard.press("Enter")
-                        page.wait_for_timeout(500)
-                        return True, f"Sent to **{contact_name}**: \"{message_to_send[:50]}{'…' if len(message_to_send) > 50 else ''}\". Window left open."
-                except Exception:
-                    pass
-                return True, f"Opened chat with **{contact_name}** but couldn't send the message. Window left open."
+                            sent_ok = True
+                        if sent_ok:
+                            page.wait_for_timeout(500)
+                            return True, f"Sent to **{contact_name}**: \"{message_to_send[:50]}{'…' if len(message_to_send) > 50 else ''}\". Window left open."
+                    except Exception:
+                        continue
+                if not sent_ok:
+                    return True, f"Opened chat with **{contact_name}** but couldn't send the message (tried several strategies). Window left open."
             return True, f"Opened chat with **{contact_name}**. Window left open."
         except Exception as e:
             err = (str(e) or "unknown")[:200]
@@ -4168,6 +4379,8 @@ def _run_messenger_msg(username: str, message: str = "") -> tuple[bool, str]:
                 return False, "Could not find the Message button on the profile. Check the username (e.g. antonia.constandinou)."
             message_btn.click()
             page.wait_for_timeout(3500)
+            if _should_prefer_longer_waits("fb_msg"):
+                page.wait_for_timeout(1500)
         else:
             # messenger.com or fallback: search then open conversation
             search_selectors = [
@@ -4344,6 +4557,34 @@ def _run_messenger_msg(username: str, message: str = "") -> tuple[bool, str]:
                         break
             except Exception:
                 pass
+        # If still not found, retry detection after extra wait (same session — no new browser open)
+        for retry_attempt in range(2):
+            if msg_input:
+                break
+            page.wait_for_timeout(2000)
+            for aa_sel in ['[data-placeholder*="Aa"]', 'div[contenteditable="true"][data-lexical-editor="true"]']:
+                try:
+                    loc = page.locator(aa_sel).first
+                    if loc.count() and loc.is_visible() and loc.bounding_box() and loc.bounding_box().get("x", 0) >= vw * 0.35:
+                        msg_input = loc
+                        break
+                except Exception:
+                    continue
+            if not msg_input:
+                try:
+                    for sel in ['div[role="dialog"] div[contenteditable="true"]', 'div[contenteditable="true"]']:
+                        loc = page.locator(sel)
+                        for i in range(min(loc.count(), 10)):
+                            L = loc.nth(i)
+                            if L.is_visible():
+                                box = L.bounding_box()
+                                if box and box.get("x", 0) >= vw * 0.35:
+                                    msg_input = L
+                                    break
+                        if msg_input:
+                            break
+                except Exception:
+                    pass
         if not msg_input:
             return False, "Could not find the message box in the chat window (contenteditable). Make sure the Message button opened the chat."
         # Focus the chat message box, clear it, type the message (no .fill() — use only contenteditable-friendly input)
@@ -4401,6 +4642,11 @@ def _stream_tts_chunks(text: str):
             continue
     yield "event: done\ndata: {}\n\n"
 
+
+# Last automation failure (for "why did you make a mistake?" and "retry and find the solution")
+_last_automation_command: str | None = None
+_last_automation_error: str | None = None
+_last_automation_params: dict = {}
 
 # Pending file creation: scope -> {path, content}. User must reply "yes" to confirm (admin only on Discord).
 _pending_writes: dict[str, dict] = {}
@@ -4695,16 +4941,25 @@ def _run_parsed_command(cmd: str, params: dict) -> str:
         if not contact:
             return "Who should I message? Say the contact name (e.g. message Marios)."
         ok, result = _run_whatsapp_web_msg(contact, desc)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "call":
         contact = (p.get("contact") or "").strip()
         if not contact:
             return "Who should I call? Say the contact name."
         ok, result = _run_whatsapp_web_call(contact)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "news":
         ok, result = _fetch_world_news()
-        return result if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return result
     if cmd == "play":
         return "Use !play <song or url> in Discord when I'm in a voice channel to play music."
     if cmd == "suno":
@@ -4712,40 +4967,61 @@ def _run_parsed_command(cmd: str, params: dict) -> str:
         if not desc:
             return "What kind of song? Give a short description."
         ok, result = _run_suno_create(desc)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "local_song":
         desc = (p.get("description") or "").strip()
         if not desc:
             return "What kind of song? Give a short description."
         ok, result = create_local_song_project(desc)
-        return f"✅ Local song package created:\n{result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ Local song package created:\n{result}"
     if cmd == "share_x":
         ok, result = _run_x_share_random_song()
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "share_facebook":
         ok, result = _run_facebook_share_random_song()
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "yt_comment":
         url = (p.get("video_url") or "").strip()
         if not url:
             return "Which YouTube video? Paste the link."
         url = _extract_youtube_video_url(url) or url
         ok, result = _run_youtube_comment(url)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "ig_dm":
         target = (p.get("target") or "").strip()
         msg_text = (p.get("message") or "").strip() or ""
         if not target:
             return "Who should I message on Instagram? Give a username or thread link."
         ok, result = _run_instagram_dm(target, msg_text)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "fb_msg":
         target = (p.get("target") or "").strip()
         msg_text = (p.get("message") or "").strip() or ""
         if not target:
             return "Who should I message on Messenger? Give a name or username."
         ok, result = _run_messenger_msg(target, msg_text)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "read":
         path = (p.get("path") or "").strip()
         if not path:
@@ -4753,12 +5029,14 @@ def _run_parsed_command(cmd: str, params: dict) -> str:
         ok, result = luna_read_file(path)
         if ok:
             return f"```\n{result}\n```" if len(result) <= 1900 else result[:1897] + "..."
+        _record_automation_failure(cmd, result, p)
         return f"❌ {result}"
     if cmd == "list":
         path = (p.get("path") or "").strip()
         ok, result = luna_list_dir(path)
         if ok:
             return f"Luna projects / {path or '.'}\n```\n{result}\n```"
+        _record_automation_failure(cmd, result, p)
         return f"❌ {result}"
     if cmd == "write":
         path = (p.get("path") or "").strip()
@@ -4766,7 +5044,10 @@ def _run_parsed_command(cmd: str, params: dict) -> str:
         if not path:
             return "Which file? Say the path (e.g. write myfile.txt with content hello)."
         ok, result = luna_write_file(path, content)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure(cmd, result, p)
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "files":
         return LUNA_COMMANDS_REPLY
     if cmd == "join":
@@ -4774,6 +5055,135 @@ def _run_parsed_command(cmd: str, params: dict) -> str:
     if cmd in ("leave", "pause", "resume", "skip", "stop", "queue"):
         return f"Use !{cmd} in Discord when I'm in a voice channel."
     return ""
+
+
+def _record_automation_failure(command_id: str, error_message: str, params: dict | None = None) -> None:
+    """Store last failed automation so the user can ask 'why did you make a mistake?' and 'retry and find the solution'."""
+    global _last_automation_command, _last_automation_error, _last_automation_params
+    _last_automation_command = (command_id or "").strip() or None
+    _last_automation_error = (error_message or "").strip() or None
+    _last_automation_params = dict(params) if params else {}
+
+
+# Learned automation solutions: remember what fixed a failure so we prefer it next time (all commands).
+_AUTOMATION_SOLUTIONS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "automation_solutions.json"
+)
+_automation_solutions_lock = threading.Lock()
+
+
+def _load_automation_solutions() -> dict:
+    """Load { command_id: [ {"error_contains": str, "hint": str}, ... ] } from disk."""
+    with _automation_solutions_lock:
+        try:
+            if os.path.isfile(_AUTOMATION_SOLUTIONS_PATH):
+                with open(_AUTOMATION_SOLUTIONS_PATH, encoding="utf-8") as f:
+                    out = json.load(f)
+                return out if isinstance(out, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_automation_solution(command_id: str, error_message: str, hint: str = "extra_wait_and_alternate_selectors") -> None:
+    """Remember that this fix worked for this command (so we prefer it next time)."""
+    command_id = (command_id or "").strip()
+    if not command_id:
+        return
+    error_snippet = (error_message or "").strip()[:120]
+    with _automation_solutions_lock:
+        data = _load_automation_solutions()
+        entries = data.setdefault(command_id, [])
+        entries.append({"error_contains": error_snippet, "hint": hint})
+        if len(entries) > 20:
+            data[command_id] = entries[-15:]
+        try:
+            os.makedirs(os.path.dirname(_AUTOMATION_SOLUTIONS_PATH), exist_ok=True)
+            with open(_AUTOMATION_SOLUTIONS_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=0)
+        except Exception:
+            pass
+
+
+def _get_learned_solutions(command_id: str) -> list:
+    """Return list of learned solution hints for this command (so we can prefer longer waits / alternate selectors)."""
+    data = _load_automation_solutions()
+    entries = data.get((command_id or "").strip(), [])
+    return [e.get("hint", "extra_wait_and_alternate_selectors") for e in entries if isinstance(e, dict)]
+
+
+def _should_prefer_longer_waits(command_id: str) -> bool:
+    """True if we have any learned solution for this command (use longer waits / alternate strategies first)."""
+    return len(_get_learned_solutions(command_id)) > 0
+
+
+def _is_why_mistake_request(msg: str) -> bool:
+    """True if the user is asking why Luna made a mistake or failed."""
+    if not (msg or msg.strip()):
+        return False
+    low = msg.strip().lower()
+    phrases = (
+        "why did you make a mistake",
+        "why did you fail",
+        "why did that fail",
+        "what went wrong",
+        "explain the error",
+        "why the error",
+        "what was the mistake",
+        "why did it fail",
+    )
+    return any(p in low for p in phrases)
+
+
+def _is_retry_solution_request(msg: str) -> bool:
+    """True if the user wants Luna to retry and find a solution."""
+    if not (msg or msg.strip()):
+        return False
+    low = msg.strip().lower()
+    phrases = (
+        "retry and find the solution",
+        "retry with a solution",
+        "find the solution and retry",
+        "try again and fix it",
+        "retry and fix it",
+        "find the solution",
+        "retry and fix",
+        "retry that",
+        "try again",
+    )
+    return any(p in low for p in phrases)
+
+
+def _handle_why_mistake() -> str:
+    """Explain the last automation failure (OpenClaw-style)."""
+    if not _last_automation_error:
+        return "I don't have a recent mistake to explain. If something failed, try the action again and then ask me why it failed."
+    cmd = _last_automation_command or "that action"
+    try:
+        explanation = ollama_chat(
+            f"The user asked why I made a mistake. Last action: {cmd}. Error: {_last_automation_error}. In one short sentence, what likely went wrong?",
+            system_prompt="You are Luna. Answer in one brief, clear sentence. No preamble.",
+            memory_scope=None,
+            message_history=None,
+        )
+        explanation = (explanation or "").strip()
+        if explanation:
+            return f"**What went wrong:** {_last_automation_error}\n\n**Why:** {explanation}"
+    except Exception:
+        pass
+    return f"**What went wrong:** {_last_automation_error}"
+
+
+def _handle_retry_solution() -> str:
+    """Retry the last failed automation once; the automation tries several strategies in one run (single browser session)."""
+    if not _last_automation_command or not _last_automation_error:
+        return "I don't have a recent failure to retry. Run an action first; if it fails, then say **retry and find the solution**."
+    cmd = _last_automation_command
+    params = _last_automation_params
+    retry_reply = _run_parsed_command(cmd, params)
+    if (retry_reply or "").strip().startswith("✅"):
+        _save_automation_solution(cmd, _last_automation_error)
+    return f"**Retrying once** (several strategies in the same run, single browser open):\n\n{retry_reply}"
 
 
 def _is_nl_command_allowed_on_discord(cmd: str, author_id: int) -> bool:
@@ -4905,22 +5315,37 @@ def _handle_web_file_command(msg: str) -> str | None:
         return f"✅ Local song package created:\n{result}" if ok else f"❌ {result}"
     if cmd in ("!share_song", "!share-song", "!xshare"):
         ok, result = _run_x_share_random_song()
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("share_x", result, {})
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd in ("!share_facebook", "!share-facebook", "!fbshare"):
         ok, result = _run_facebook_share_random_song()
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("share_facebook", result, {})
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "!share" and args.lower().startswith("song"):
         ok, result = _run_x_share_random_song()
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("share_x", result, {})
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "!share" and args.lower().startswith("facebook"):
         ok, result = _run_facebook_share_random_song()
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("share_facebook", result, {})
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd in ("!yt_comment", "!youtube_comment", "!comment_youtube"):
         if not args:
             return "Usage: !yt_comment <youtube_video_url>"
         video_url = _extract_youtube_video_url(args) or args.strip()
         ok, result = _run_youtube_comment(video_url)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("yt_comment", result, {"video_url": video_url})
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd in ("!ig_dm", "!instagram_dm", "!igdm"):
         if not args:
             return "Usage: !ig_dm <username|instagram_direct_thread_url> [message]"
@@ -4928,7 +5353,10 @@ def _handle_web_file_command(msg: str) -> str | None:
         target = (parts[0] or "").strip()
         custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
         ok, result = _run_instagram_dm(target, custom_message)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("ig_dm", result, {"target": target, "message": custom_message})
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd in ("!fb_msg", "!messenger", "!fbmsg"):
         if not args:
             return "Usage: !fb_msg <username or name> [message] (e.g. !fb_msg John or !fb_msg John have a great day)"
@@ -4936,12 +5364,18 @@ def _handle_web_file_command(msg: str) -> str | None:
         target = (parts[0] or "").strip()
         custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
         ok, result = _run_messenger_msg(target, custom_message)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("fb_msg", result, {"target": target, "message": custom_message})
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "!call":
         if not args:
             return "Usage: !call <contact name or number> (e.g. !call Marios or !call +357 96 724268)"
         ok, result = _run_whatsapp_web_call(args)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("call", result, {"contact": args})
+            return f"❌ {result}"
+        return f"✅ {result}"
     if cmd == "!msg":
         if not args:
             return "Usage: !msg <contact> [description] (e.g. !msg Marios or !msg Marios goodnight)"
@@ -4949,7 +5383,10 @@ def _handle_web_file_command(msg: str) -> str | None:
         if not contact_name:
             return "Usage: !msg <contact> [description]"
         ok, result = _run_whatsapp_web_msg(contact_name, description)
-        return f"✅ {result}" if ok else f"❌ {result}"
+        if not ok:
+            _record_automation_failure("msg", result, {"contact": contact_name, "description": description or ""})
+            return f"❌ {result}"
+        return f"✅ {result}"
     return None
 
 
@@ -5003,6 +5440,17 @@ def api_chat():
     if file_reply is not None:
         append_exchange(scope, msg, file_reply)
         return jsonify({"reply": file_reply})
+    # OpenClaw-style: "why did you make a mistake?" / "retry and find the solution"
+    if _is_why_mistake_request(msg):
+        reply = _handle_why_mistake()
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
+    if _is_retry_solution_request(msg):
+        reply = _handle_retry_solution()
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
     # Natural language: map plain text to a command and run it (e.g. "message Marios goodnight" -> msg)
     if not msg.strip().startswith("!"):
         parsed = _parse_natural_language_command(msg)
@@ -5238,6 +5686,17 @@ async def on_message(message: discord.Message):
         if text_lower in ("no", "cancel") and memory_scope in _pending_writes:
             _pending_writes.pop(memory_scope, None)
             reply = "Cancelled."
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        # OpenClaw-style: "why did you make a mistake?" / "retry and find the solution"
+        if _is_why_mistake_request(text):
+            reply = await asyncio.to_thread(_handle_why_mistake)
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        if _is_retry_solution_request(text):
+            reply = await asyncio.to_thread(_handle_retry_solution)
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
@@ -5528,6 +5987,8 @@ async def cmd_share_song(ctx: commands.Context):
         return
     await ctx.reply("Picking a random song from your YouTube channel and sharing it to X...")
     ok, result = await asyncio.to_thread(_run_x_share_random_song)
+    if not ok:
+        _record_automation_failure("share_x", result, {})
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
 
 
@@ -5539,6 +6000,8 @@ async def cmd_share_facebook(ctx: commands.Context):
         return
     await ctx.reply("Picking a random song from your YouTube channel and sharing it to Facebook...")
     ok, result = await asyncio.to_thread(_run_facebook_share_random_song)
+    if not ok:
+        _record_automation_failure("share_facebook", result, {})
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
 
 
@@ -5555,6 +6018,8 @@ async def cmd_yt_comment(ctx: commands.Context, *, video_url: str = ""):
         return
     await ctx.reply("Opening YouTube, transcribing the video, and posting a comment...")
     ok, result = await asyncio.to_thread(_run_youtube_comment, target)
+    if not ok:
+        _record_automation_failure("yt_comment", result, {"video_url": target})
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
 
 
@@ -5574,6 +6039,8 @@ async def cmd_ig_dm(ctx: commands.Context, *, args: str = ""):
     announce_target = target if _extract_instagram_thread_url(target) else f"@{re.sub(r'^@', '', target)}"
     await ctx.reply(f"Opening Instagram and messaging {announce_target}...")
     ok, result = await asyncio.to_thread(_run_instagram_dm, target, custom_message)
+    if not ok:
+        _record_automation_failure("ig_dm", result, {"target": target, "message": custom_message})
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
 
 
@@ -5592,6 +6059,8 @@ async def cmd_fb_msg(ctx: commands.Context, *, args: str = ""):
     custom_message = (parts[1] or "").strip() if len(parts) > 1 else ""
     await ctx.reply(f"Opening Messenger and sending a message to **{target}**...")
     ok, result = await asyncio.to_thread(_run_messenger_msg, target, custom_message)
+    if not ok:
+        _record_automation_failure("fb_msg", result, {"target": target, "message": custom_message})
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
 
 
@@ -5964,6 +6433,8 @@ async def cmd_whatsapp_call(ctx: commands.Context, *, contact: str = ""):
         return
     await ctx.reply(f"Opening WhatsApp and starting a call with **{contact}**…")
     ok, result = await asyncio.to_thread(_run_whatsapp_web_call, contact)
+    if not ok:
+        _record_automation_failure("call", result, {"contact": contact})
     await ctx.reply(result if ok else f"❌ {result}")
 
 
@@ -5983,6 +6454,8 @@ async def cmd_whatsapp_msg(ctx: commands.Context, *, args: str = ""):
         return
     await ctx.reply(f"Opening WhatsApp and sending message to **{contact_name}**…")
     ok, result = await asyncio.to_thread(_run_whatsapp_web_msg, contact_name, description)
+    if not ok:
+        _record_automation_failure("msg", result, {"contact": contact_name, "description": description or ""})
     await ctx.reply(result if ok else f"❌ {result}")
 
 

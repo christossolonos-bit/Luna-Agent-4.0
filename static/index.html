@@ -185,6 +185,32 @@
     .btn-stop-tts:hover {
       background: rgba(200, 80, 80, 0.5);
     }
+    .btn-mic {
+      padding: 0.75rem 1rem;
+      background: rgba(0, 150, 180, 0.35);
+      border: 1px solid rgba(0, 255, 255, 0.35);
+      border-radius: 10px;
+      color: #e0e8ff;
+      font-size: 1.1rem;
+      cursor: pointer;
+      transition: background 0.2s, box-shadow 0.2s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 48px;
+    }
+    .btn-mic:hover {
+      background: rgba(0, 180, 220, 0.45);
+      box-shadow: 0 0 12px rgba(0, 255, 255, 0.2);
+    }
+    .btn-mic.recording {
+      background: rgba(200, 60, 60, 0.5);
+      border-color: rgba(255, 100, 100, 0.6);
+      animation: micPulse 1s ease-in-out infinite;
+    }
+    @keyframes micPulse {
+      50% { box-shadow: 0 0 16px rgba(255, 100, 100, 0.5); }
+    }
     .status {
       font-size: 0.8rem;
       color: rgba(224, 232, 255, 0.5);
@@ -206,6 +232,7 @@
     <div class="chat-log" id="chatLog"></div>
     <div class="input-row">
       <textarea id="input" placeholder="Chat with Luna…" rows="1"></textarea>
+      <button type="button" class="btn-mic" id="mic" title="Click to start recording, click again to stop and put text in the message box">🎤</button>
       <button type="button" class="btn-stop-tts" id="stopTts" title="Stop TTS">Stop TTS</button>
       <button type="button" class="btn-send" id="send">Send</button>
     </div>
@@ -217,9 +244,70 @@
     const input = document.getElementById('input');
     const sendBtn = document.getElementById('send');
     const stopTtsBtn = document.getElementById('stopTts');
+    const micBtn = document.getElementById('mic');
     const statusEl = document.getElementById('status');
 
     function setStatus(msg) { statusEl.textContent = msg; }
+
+    // Microphone: start/stop recording, transcribe into message box (Web Speech API)
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition = null;
+    let isRecording = false;
+    let transcriptBuffer = '';
+
+    if (SpeechRecognition) {
+      recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (e) => {
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          if (e.results[i].isFinal) transcriptBuffer += e.results[i][0].transcript;
+        }
+      };
+
+      recognition.onend = () => {
+        if (transcriptBuffer.trim()) {
+          const current = (input.value || '').trim();
+          input.value = current ? current + ' ' + transcriptBuffer.trim() : transcriptBuffer.trim();
+          setStatus('Transcript added. Edit if needed, then press Send.');
+        } else {
+          setStatus('');
+        }
+        transcriptBuffer = '';
+        isRecording = false;
+        micBtn.classList.remove('recording');
+        setTimeout(() => setStatus(''), 3000);
+      };
+
+      recognition.onerror = (e) => {
+        if (e.error !== 'aborted') setStatus('Speech error: ' + (e.error || 'unknown'));
+        isRecording = false;
+        micBtn.classList.remove('recording');
+      };
+
+      micBtn.addEventListener('click', () => {
+        if (!recognition) return;
+        if (isRecording) {
+          recognition.stop();
+          return;
+        }
+        transcriptBuffer = '';
+        try {
+          recognition.start();
+          isRecording = true;
+          micBtn.classList.add('recording');
+          setStatus('Listening… Click mic again to stop.');
+        } catch (err) {
+          setStatus('Could not start microphone.');
+          setTimeout(() => setStatus(''), 3000);
+        }
+      });
+    } else {
+      micBtn.disabled = true;
+      micBtn.title = 'Speech recognition not supported in this browser (try Chrome/Edge).';
+    }
 
     stopTtsBtn.addEventListener('click', async () => {
       try {
