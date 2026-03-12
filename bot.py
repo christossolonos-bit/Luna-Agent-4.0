@@ -8,6 +8,7 @@ Also runs a web UI at http://127.0.0.1:5050 — Jarvis-style chat in the browser
 """
 import asyncio
 import base64
+import ctypes
 import html
 import io
 import json
@@ -20,6 +21,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import webbrowser
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -30,6 +32,10 @@ from email.utils import parsedate_to_datetime
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+try:
+    import schedule
+except ImportError:
+    schedule = None
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 
 from luna_files import (
@@ -38,6 +44,7 @@ from luna_files import (
     write_file as luna_write_file,
     list_dir as luna_list_dir,
     modify_file as luna_modify_file,
+    ALLOWED_BASE as LUNA_PROJECTS_BASE,
 )
 
 
@@ -85,7 +92,7 @@ from luna_profile import (
     PROFILE_FIELDS,
     merge_profiles,
 )
-from luna_conversation import get_recent_conversation, append_exchange, merge_conversations
+from luna_conversation import get_recent_conversation, append_exchange, merge_conversations, get_recent_user_messages, count_user_messages
 from local_music import create_local_song_project
 
 # Ollama defaults (override in .env: OLLAMA_BASE_URL, OLLAMA_MODEL)
@@ -101,6 +108,131 @@ path: <path>
 END_LUNA_WRITE
 Use path relative to Luna projects (e.g. index.html, css/styles.css, js/game.js). For multiple files (e.g. HTML + CSS + JS for a game), output multiple blocks back-to-back. In your reply text, briefly say what you prepared and that they can reply "yes" to create the files in Luna projects. Do not mention the block names. Never say you have already created or saved the file—creation happens only after the user replies "yes". Do not tell the user to use !write. For read/list/edit only, tell them to use !read, !list, !edit.
 You have a permanent user profile (name, location, occupation, interests, birthday). When you don't know a profile field, politely ask the user; their answers are saved automatically."""
+
+# SOUL.md + TOOLS.md + skills (OpenClaw-style): loaded from data/ and injected into the system prompt.
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_SOUL_PATH = os.path.join(_DATA_DIR, "SOUL.md")
+_TOOLS_PATH = os.path.join(_DATA_DIR, "TOOLS.md")
+_OBJECTIVES_PATH = os.path.join(_DATA_DIR, "OBJECTIVES.md")
+_SKILLS_DIR = os.path.join(_DATA_DIR, "skills")
+_ACTION_LOG_PATH = os.path.join(_DATA_DIR, "action_log.jsonl")
+_action_log_lock = threading.Lock()
+
+
+def _load_soul_content() -> str:
+    """Load SOUL.md (identity/personality). Edit this file to change who Luna is."""
+    try:
+        if os.path.isfile(_SOUL_PATH):
+            with open(_SOUL_PATH, encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _load_tools_content() -> str:
+    """Load TOOLS.md (list of commands and when to use them). Edit to document Luna's tools."""
+    try:
+        if os.path.isfile(_TOOLS_PATH):
+            with open(_TOOLS_PATH, encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _load_objectives_content() -> str:
+    """Load OBJECTIVES.md (objectives and constraints Luna must follow). Edit to add rules."""
+    try:
+        if os.path.isfile(_OBJECTIVES_PATH):
+            with open(_OBJECTIVES_PATH, encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _get_identity_file_hint() -> str:
+    """Return a hint for Luna when SOUL/TOOLS/OBJECTIVES are missing or short: she can ask the user and record with LUNA_RECORD_*."""
+    missing = []
+    if len(_load_soul_content()) < 50:
+        missing.append("SOUL.md (who you are / personality)")
+    if len(_load_tools_content()) < 50:
+        missing.append("TOOLS.md (what you can do)")
+    if len(_load_objectives_content()) < 50:
+        missing.append("OBJECTIVES.md (rules to follow)")
+    if not missing:
+        return ""
+    return (
+        "The following identity files are empty or very short: " + ", ".join(missing) + ". "
+        "You can ask the user what to put in each. When you want to save their *next* reply into a file, end your message with exactly one of these on its own line: LUNA_RECORD_SOUL, LUNA_RECORD_TOOLS, or LUNA_RECORD_OBJECTIVES. "
+        "Their next message will then be saved to that file (like when you gather profile info)."
+    )
+
+
+def _log_action(scope: str, action: str, details: dict | None = None) -> None:
+    """Append one entry to the action log (audit trail). Thread-safe. details: optional dict (path, result, etc.)."""
+    details = dict(details or {})
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "scope": scope or "",
+        "action": action,
+        **details,
+    }
+    with _action_log_lock:
+        try:
+            os.makedirs(os.path.dirname(_ACTION_LOG_PATH), exist_ok=True)
+            with open(_ACTION_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+
+def _load_skills_content() -> str:
+    """Load all .md files from data/skills/ and return a single block. Each file is a skill Luna can follow when relevant."""
+    out = []
+    try:
+        if not os.path.isdir(_SKILLS_DIR):
+            return ""
+        for name in sorted(os.listdir(_SKILLS_DIR)):
+            if not name.endswith(".md"):
+                continue
+            path = os.path.join(_SKILLS_DIR, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read().strip()
+                if text:
+                    skill_name = name[:-3].replace("_", " ").replace("-", " ").title()
+                    out.append(f"### Skill: {skill_name}\n{text}")
+            except Exception:
+                continue
+        if not out:
+            return ""
+        return "\n\n---\n\n".join(out)
+    except Exception:
+        return ""
+
+
+def _get_effective_system_prompt(base: str) -> str:
+    """Inject SOUL (identity), TOOLS (capabilities), objectives (constraints), and skills (markdown) into the base system prompt."""
+    soul = _load_soul_content()
+    tools = _load_tools_content()
+    objectives = _load_objectives_content()
+    skills = _load_skills_content()
+    parts = []
+    if soul:
+        parts.append(soul)
+    parts.append(base.strip())
+    if tools:
+        parts.append("---\nTools and commands (use these when the user asks):\n" + tools)
+    if objectives:
+        parts.append("---\nObjectives and constraints (follow these):\n" + objectives)
+    if skills:
+        parts.append("---\nSkills (follow when relevant to the user's request):\n" + skills)
+    return "\n\n".join(parts)
+
 
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
@@ -167,6 +299,17 @@ for _part in DISCORD_DM_SYNC_USER_IDS.split(","):
         continue
     try:
         _discord_dm_sync_ids_int.add(int(_id_txt))
+    except ValueError:
+        continue
+# Text channel IDs where Luna auto-joins voice and speaks (TTS) when she replies. Empty = no auto-join; Luna only speaks in VC if someone used !join. Comma-separated.
+DISCORD_TTS_CHANNEL_IDS = (os.environ.get("DISCORD_TTS_CHANNEL_IDS") or "").strip()
+_discord_tts_channel_ids: set[int] = set()
+for _part in DISCORD_TTS_CHANNEL_IDS.split(","):
+    _id_txt = (_part or "").strip()
+    if not _id_txt:
+        continue
+    try:
+        _discord_tts_channel_ids.add(int(_id_txt))
     except ValueError:
         continue
 SUNO_CREATE_URL = os.environ.get("SUNO_CREATE_URL", "https://suno.com/create").strip() or "https://suno.com/create"
@@ -242,6 +385,11 @@ _x_bootstrap_running = False
 _fb_share_lock = threading.Lock()
 _fb_bootstrap_lock = threading.Lock()
 _fb_bootstrap_running = False
+# Scheduled X/Facebook posts: 2 times per day, Cyprus time (10:00 and 18:00). Uses system local time—set PC/server to Cyprus (EET/EEST) or override with SCHEDULE_SHARE_TIMES.
+SCHEDULE_SHARE_TIMES = (os.environ.get("SCHEDULE_SHARE_TIMES") or "10:00,18:00").strip().split(",")
+SCHEDULE_SHARE_TIMES = [t.strip() for t in SCHEDULE_SHARE_TIMES if t.strip()]
+if not SCHEDULE_SHARE_TIMES:
+    SCHEDULE_SHARE_TIMES = ["10:00", "18:00"]
 _yt_comment_lock = threading.Lock()
 _yt_bootstrap_lock = threading.Lock()
 _yt_bootstrap_running = False
@@ -254,6 +402,24 @@ _wa_web_bootstrap_running = False
 # Persist WhatsApp Web browser so the window stays open after !call / !msg
 _wa_web_context = None
 _wa_web_playwright = None
+
+
+def _clear_wa_web_context() -> None:
+    """Clear cached WhatsApp Web context so next use creates a fresh one (fixes 'cannot switch to a different thread' etc.)."""
+    global _wa_web_context, _wa_web_playwright
+    ctx, pw = _wa_web_context, _wa_web_playwright
+    _wa_web_context = None
+    _wa_web_playwright = None
+    try:
+        if ctx is not None:
+            ctx.close()
+    except Exception:
+        pass
+    try:
+        if pw is not None:
+            pw.stop()
+    except Exception:
+        pass
 _messenger_lock = threading.Lock()
 _messenger_bootstrap_lock = threading.Lock()
 _messenger_bootstrap_running = False
@@ -697,10 +863,359 @@ async def _on_music_track_end(guild_id: int, err=None) -> None:
     _start_next_music_track(guild_id, guild.voice_client)
 
 
+# User style (mannerisms/speech patterns): learned over time, injected so Luna adapts her replies.
+_USER_STYLE_FILE = os.path.join(_DATA_DIR, "user_style.json")
+_USER_STYLE_UPDATE_EVERY = 10  # re-learn style every N new user messages
+_user_style_lock = threading.Lock()
+
+
+def _load_user_style_data() -> dict:
+    """Load { scope: { "summary": str, "last_user_count": int } }."""
+    with _user_style_lock:
+        try:
+            if os.path.isfile(_USER_STYLE_FILE):
+                with open(_USER_STYLE_FILE, encoding="utf-8") as f:
+                    out = json.load(f)
+                return out if isinstance(out, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_user_style(scope: str, summary: str, last_user_count: int) -> None:
+    with _user_style_lock:
+        data = _load_user_style_data()
+        data[scope] = {"summary": (summary or "").strip(), "last_user_count": last_user_count}
+        try:
+            os.makedirs(os.path.dirname(_USER_STYLE_FILE), exist_ok=True)
+            with open(_USER_STYLE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=0, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def get_user_style_prompt(scope: str) -> str | None:
+    """Return a short prompt block to adapt Luna's replies to this user's mannerisms, or None."""
+    if not scope:
+        return None
+    data = _load_user_style_data()
+    entry = data.get(scope)
+    if not isinstance(entry, dict):
+        return None
+    summary = (entry.get("summary") or "").strip()
+    if not summary:
+        return None
+    return f"Adapt your replies to this user's style: {summary} Mirror their tone and mannerisms when appropriate."
+
+
+# Small agents: user-defined tools Luna can use (create with description, list, inject into prompt for tool-calling).
+_AGENTS_DIR = os.path.join(_DATA_DIR, "agents")
+_agents_lock = threading.Lock()
+
+# When True, Luna opens a new Cursor window with the built agent file (env: LUNA_OPEN_CURSOR_FOR_AGENTS=1).
+_OPEN_CURSOR_FOR_AGENTS = os.environ.get("LUNA_OPEN_CURSOR_FOR_AGENTS", "1").strip().lower() in ("1", "true", "yes")
+
+
+def _generate_agent_implementation(name: str, description: str, instructions: str) -> str | None:
+    """Use Ollama to generate a Python script that implements the agent. Returns code string or None."""
+    system = (
+        "You are a Python developer. The user wants a small agent script for Luna. "
+        "Output only valid Python code, no markdown, no explanation. "
+        "The script will live in data/agents/. To reach project root use: root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))). "
+        "For reminder agents: append one line to os.path.join(root, 'data', 'reminders.txt'). "
+        "For other agents: implement the described behavior in a single script runnable as: python script.py. "
+        "Use only the standard library. If the agent should run on a schedule, do the action once and add a short comment that the user can schedule it."
+    )
+    prompt = (
+        f"Agent name: {name}\n"
+        f"Description: {description}\n"
+        f"What it should do: {instructions}\n\n"
+        "Write the Python script that implements this. Output only the code."
+    )
+    try:
+        raw = ollama_chat(prompt, system_prompt=system, memory_scope=None, message_history=None)
+        if not raw or not raw.strip():
+            return None
+        code = raw.strip()
+        # Strip markdown code block if present
+        if code.startswith("```"):
+            lines = code.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            code = "\n".join(lines)
+        if "def " in code or "import " in code or "print(" in code or "open(" in code:
+            return code
+        return None
+    except Exception:
+        return None
+
+
+def _analyze_agent_code(code: str, description: str) -> tuple[bool, str | None, str | None]:
+    """Use the coder LLM to check if the agent script is correct. Returns (is_correct, reason_if_wrong, corrected_code_or_none)."""
+    system = (
+        "You are a Python code reviewer. Check the code for: valid syntax, correct logic, and correct path handling "
+        "(script lives in data/agents/, project root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))). "
+        "Reply with exactly one line: either 'OK' or 'FIX: <brief reason>'."
+    )
+    prompt = f"Agent purpose: {description}\n\nCode to review:\n```python\n{code}\n```"
+    try:
+        raw = ollama_chat(prompt, system_prompt=system, memory_scope=None, message_history=None)
+        raw = (raw or "").strip().upper()
+        if raw.startswith("OK") or "OK" == raw.split("\n")[0].strip():
+            return True, None, None
+        reason = ""
+        if raw.startswith("FIX:"):
+            reason = raw[4:].strip().split("\n")[0].strip()[:500]
+        else:
+            reason = raw.split("\n")[0].strip()[:500] or "Issue found"
+        return False, reason, None
+    except Exception:
+        return True, None, None  # on error assume ok and don't block
+
+
+def _get_corrected_agent_code(original_code: str, reason: str, description: str) -> str | None:
+    """Ask the coder LLM for a corrected version of the agent script. Returns corrected code or None."""
+    system = (
+        "You are a Python developer. Output only valid Python code, no markdown fences, no explanation. "
+        "The script lives in data/agents/; use root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) for paths. "
+        "For reminders use os.path.join(root, 'data', 'reminders.txt'). Fix the issue and keep the same behavior."
+    )
+    prompt = (
+        f"Issue: {reason}\n\nAgent purpose: {description}\n\nCurrent code:\n```python\n{original_code}\n```\n\n"
+        "Output the corrected Python code only."
+    )
+    try:
+        raw = ollama_chat(prompt, system_prompt=system, memory_scope=None, message_history=None)
+        if not raw or not raw.strip():
+            return None
+        code = raw.strip()
+        if code.startswith("```"):
+            lines = code.split("\n")
+            if lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            code = "\n".join(lines)
+        if "def " in code or "import " in code or "print(" in code or "open(" in code:
+            return code
+        return None
+    except Exception:
+        return None
+
+
+def _get_cursor_exe() -> str | None:
+    """Return path to Cursor IDE executable (new window for agent building), or None."""
+    if sys.platform == "win32":
+        localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if localappdata:
+            for sub in ("Programs\\cursor\\Cursor.exe", "cursor\\Cursor.exe"):
+                p = os.path.join(localappdata, sub)
+                if os.path.isfile(p):
+                    return p
+        # Cursor may be in PATH as 'cursor'
+        for name in ("cursor", "Cursor.exe"):
+            try:
+                import shutil
+                exe = shutil.which(name)
+                if exe:
+                    return exe
+            except Exception:
+                pass
+    elif sys.platform == "darwin":
+        p = "/Applications/Cursor.app/Contents/MacOS/Cursor"
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _open_cursor_new_window(path: str) -> bool:
+    """Open path (file or folder) in a new Cursor window. Returns True if launched."""
+    path = (path or "").strip()
+    if not path or not os.path.exists(path):
+        return False
+    path = os.path.abspath(path)
+    exe = _get_cursor_exe()
+    if not exe:
+        return False
+    try:
+        subprocess.Popen(
+            [exe, "--new-window", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=os.path.dirname(path) if os.path.isfile(path) else path,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _list_agents() -> list[dict]:
+    """Return all saved agents: list of {name, description, instructions, created_at}."""
+    if not os.path.isdir(_AGENTS_DIR):
+        return []
+    out = []
+    with _agents_lock:
+        try:
+            for f in sorted(os.listdir(_AGENTS_DIR)):
+                if not f.endswith(".json"):
+                    continue
+                path = os.path.join(_AGENTS_DIR, f)
+                try:
+                    with open(path, encoding="utf-8") as fp:
+                        data = json.load(fp)
+                    if isinstance(data, dict) and (data.get("name") or data.get("description")):
+                        out.append({
+                            "name": (data.get("name") or "").strip() or os.path.splitext(f)[0],
+                            "description": (data.get("description") or "").strip(),
+                            "instructions": (data.get("instructions") or "").strip(),
+                            "created_at": (data.get("created_at") or "").strip(),
+                        })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return out
+
+
+def _create_agent(description: str) -> tuple[bool, str]:
+    """Create a small agent from the user's description. Uses Ollama to generate name and instructions. Returns (ok, message)."""
+    description = (description or "").strip()
+    if not description or len(description) < 3:
+        return False, "Give a short description of what the agent should do (e.g. 'reminds me to drink water every hour')."
+    try:
+        prompt = (
+            f"User wants to create a small agent. Their description: \"{description}\"\n\n"
+            "Reply with exactly two lines:\n"
+            "NAME: <short name for the agent, 2-4 words, no quotes>\n"
+            "INSTRUCTIONS: <one or two sentences describing what this agent does and when to use it>"
+        )
+        raw = ollama_chat(
+            prompt,
+            system_prompt="You output only NAME: and INSTRUCTIONS: lines. Be concise.",
+            memory_scope=None,
+            message_history=None,
+        )
+        name = "Custom Agent"
+        instructions = description
+        if raw:
+            for line in (raw or "").strip().split("\n"):
+                line = line.strip()
+                if line.upper().startswith("NAME:"):
+                    name = line[5:].strip().strip("'\"").strip()[:80] or name
+                elif line.upper().startswith("INSTRUCTIONS:"):
+                    instructions = line[13:].strip().strip("'\"").strip()[:500] or instructions
+        slug = re.sub(r"[^\w\-]", "_", name.lower()).strip("_")[:40] or "agent"
+        slug = re.sub(r"_+", "_", slug) or "agent"
+        created = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "name": name,
+            "description": description,
+            "instructions": instructions,
+            "created_at": created,
+        }
+        os.makedirs(_AGENTS_DIR, exist_ok=True)
+        path = os.path.join(_AGENTS_DIR, f"{slug}.json")
+        with _agents_lock:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        _log_action("", "agent_create", {"name": name, "slug": slug})
+        msg = f"Created agent **{name}**: {instructions[:120]}{'…' if len(instructions) > 120 else ''}"
+        impl_path = os.path.join(_AGENTS_DIR, f"{slug}.py")
+        code = _generate_agent_implementation(name, description, instructions)
+        if code:
+            # Analyze with coder LLM; correct if wrong
+            is_ok, reason, corrected = _analyze_agent_code(code, description)
+            if not is_ok and reason:
+                corrected = _get_corrected_agent_code(code, reason, description)
+                if corrected:
+                    code = corrected
+                    msg += " Analyzed and corrected the code."
+                else:
+                    msg += " Analysis found an issue; review in Cursor."
+            elif is_ok:
+                msg += " Code checked and looks good."
+            try:
+                with open(impl_path, "w", encoding="utf-8") as f:
+                    f.write(code)
+                # Also write under Luna projects so "!run agents/slug.py" works
+                luna_write_file(f"agents/{slug}.py", code)
+                msg += " Run it with **!run agents/" + slug + ".py** (say **yes** when asked)."
+            except Exception:
+                msg += " (Could not save implementation file.)"
+        if _OPEN_CURSOR_FOR_AGENTS:
+            try:
+                open_path = impl_path if code and os.path.isfile(impl_path) else os.path.join(_AGENTS_DIR, f"{slug}_prompt.md")
+                if not os.path.isfile(open_path):
+                    prompt_content = (
+                        f"# Agent: {name}\n\n**Description:** {description}\n\n**Instructions:** {instructions}\n\n"
+                        "---\n\nImplement this agent: a small Python script Luna can run (e.g. for reminders, append to data/reminders.txt)."
+                    )
+                    with open(open_path, "w", encoding="utf-8") as f:
+                        f.write(prompt_content)
+                if _open_cursor_new_window(open_path):
+                    msg += " Opened it in Cursor." if code else " Opened a prompt in Cursor so you can finish the implementation."
+                else:
+                    msg += f" File: `{os.path.basename(open_path)}` (Cursor not found or could not open)."
+            except Exception:
+                msg += " (Could not open Cursor.)"
+        return True, msg
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def get_agents_prompt() -> str | None:
+    """Return a prompt block listing the user's small agents so Luna can recommend or 'call' them when relevant."""
+    agents = _list_agents()
+    if not agents:
+        return None
+    lines = ["**Your small agents (use or recommend when relevant):**"]
+    for a in agents:
+        name = (a.get("name") or "").strip() or "Agent"
+        desc = (a.get("description") or a.get("instructions") or "").strip()
+        lines.append(f"- **{name}**: {desc[:150]}{'…' if len(desc) > 150 else ''}")
+    return "\n".join(lines)
+
+
+def _maybe_update_user_style(scope: str) -> None:
+    """If enough new user messages since last update, re-learn style from recent messages and save."""
+    if not scope:
+        return
+    current_count = count_user_messages(scope)
+    data = _load_user_style_data()
+    entry = data.get(scope)
+    last_count = entry.get("last_user_count", 0) if isinstance(entry, dict) else 0
+    if current_count - last_count < _USER_STYLE_UPDATE_EVERY:
+        return
+    recent = get_recent_user_messages(scope, max_messages=25)
+    if len(recent) < 5:
+        return
+    sample = "\n".join(recent[-20:])
+    prompt = (
+        "Summarize this user's communication style in 2-4 short sentences. "
+        "Include: tone (casual/formal), sentence length, typical phrases or punctuation, how they address you. "
+        "Be concise. Output only the summary, no preamble.\n\nUser messages:\n" + sample
+    )
+    try:
+        summary = ollama_chat(
+            prompt,
+            system_prompt="You are an analyst. Output only the style summary, 2-4 sentences, no labels or bullets.",
+            memory_scope=None,
+            message_history=None,
+        )
+        summary = (summary or "").strip()[:600]
+        if summary:
+            _save_user_style(scope, summary, current_count)
+    except Exception:
+        pass
+
+
 def _build_system_prompt(base: str | None, memory_scope: str | None) -> str | None:
-    """Append user profile and 4-layer memory to system prompt if scope given. Discord = per-user scope."""
+    """Append user profile, 4-layer memory, and learned style to system prompt if scope given. SOUL.md and TOOLS.md are injected into base."""
     if not base:
         return None
+    base = _get_effective_system_prompt(base)
     if not memory_scope:
         return base
     parts = [base.rstrip()]
@@ -709,7 +1224,8 @@ def _build_system_prompt(base: str | None, memory_scope: str | None) -> str | No
         parts.append(
             "The current user is Chris (Solonaras). They use both the web UI and Discord—treat them as the same person. "
             "Remember them and continue conversations naturally on either platform. "
-            "When they ask for a game, website, or any code to be saved in Luna projects, you must add LUNA_WRITE_FILE blocks (one per file) so the files are created there—do not only show code in the chat."
+            "When they ask for a game, website, or any code to be saved in Luna projects, you must add LUNA_WRITE_FILE blocks (one per file) so the files are created there—do not only show code in the chat. "
+            "When they ask you to *do* something (e.g. remind me, set a reminder, do X) or *run* a script, you must trigger the 'do' or 'run' command (output the JSON command)—do NOT create a file that only lists instructions or 'what to do'. Execute the action via the tool, not by writing a how-to file."
         )
     elif memory_scope.startswith("discord"):
         parts.append(
@@ -722,6 +1238,15 @@ def _build_system_prompt(base: str | None, memory_scope: str | None) -> str | No
     memory_block = get_memory_prompt(memory_scope)
     if memory_block:
         parts.append(memory_block)
+    style_block = get_user_style_prompt(memory_scope)
+    if style_block:
+        parts.append(style_block)
+    agents_block = get_agents_prompt()
+    if agents_block:
+        parts.append(agents_block)
+    identity_hint = _get_identity_file_hint()
+    if identity_hint and memory_scope and (memory_scope == LINKED_SCOPE or memory_scope == "web"):
+        parts.append("---\n" + identity_hint)
     if len(parts) <= 1:
         return base
     return "\n\n".join(parts)
@@ -804,6 +1329,55 @@ def _try_capture_profile(scope: str, user_message: str) -> None:
         val = m.group(1).strip()[:100]
         if len(val) >= 2:
             set_profile_field(scope, "birthday", val)
+
+
+# Context compaction: when conversation history exceeds this many messages, older part is summarized (OpenClaw-style).
+_COMPACT_THRESHOLD = 20
+_KEEP_RECENT_MESSAGES = 18  # keep this many most recent messages in full; older ones become a summary
+
+
+def _summarize_conversation(messages: list[dict]) -> str:
+    """Ask Ollama for a 2-4 sentence summary of the conversation. Returns summary or empty on failure."""
+    if not messages:
+        return ""
+    lines = []
+    for m in messages:
+        role = (m.get("role") or "user").strip().lower()
+        content = (m.get("content") or "").strip()[:500]
+        if content:
+            lines.append(f"{'User' if role == 'user' else 'Luna'}: {content}")
+    if not lines:
+        return ""
+    block = "\n".join(lines[-30:])  # at most last 30 message contents
+    prompt = (
+        "Summarize this conversation in 2-4 short sentences. Keep only main topics, decisions, and outcomes. "
+        "Output only the summary, no preamble.\n\n" + block
+    )
+    try:
+        out = ollama_chat(
+            prompt,
+            system_prompt="You are a summarizer. Output only the summary text, 2-4 sentences.",
+            memory_scope=None,
+            message_history=None,
+        )
+        return (out or "").strip()[:600] or ""
+    except Exception:
+        return ""
+
+
+def _compact_conversation_history(messages: list[dict]) -> list[dict]:
+    """If history is long, summarize the oldest part and keep recent messages. Returns list suitable for message_history."""
+    if not messages or len(messages) <= _COMPACT_THRESHOLD:
+        return list(messages)
+    old = messages[: -_KEEP_RECENT_MESSAGES]
+    recent = messages[-_KEEP_RECENT_MESSAGES:]
+    summary = _summarize_conversation(old)
+    if not summary:
+        return recent[-_COMPACT_THRESHOLD:]  # fallback: just trim
+    return [
+        {"role": "user", "content": f"[Previous conversation summary]: {summary}"},
+        {"role": "assistant", "content": "Understood."},
+    ] + recent
 
 
 def ollama_chat(
@@ -1398,6 +1972,288 @@ def _fetch_world_news(limit: int = 8) -> tuple[bool, str]:
         link = (it.get("link") or "").strip()
         lines.append(f"{i}. {title}\n{link}")
     return True, "\n\n".join(lines)
+
+
+def _fetch_search_results(query: str, max_results: int = 10) -> list[dict]:
+    """Fetch search results from DuckDuckGo HTML. Returns list of {title, url, snippet}."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query, safe="")
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    html = html.replace("&amp;", "&")
+    results = []
+    # result__a: title + url
+    title_url_pat = re.compile(
+        r'class="result__a"[^>]*href="//duckduckgo.com/l/\?uddg=([^&"]+)[^"]*"[^>]*>([^<]+)</a>',
+        re.I,
+    )
+    for m in title_url_pat.finditer(html):
+        if len(results) >= max_results:
+            break
+        enc = m.group(1).strip()
+        try:
+            real_url = urllib.parse.unquote(enc)
+        except Exception:
+            continue
+        title = (m.group(2) or "").strip()
+        if not real_url or not title:
+            continue
+        results.append({"title": title[:200], "url": real_url[:500], "snippet": ""})
+    # result__snippet: text between > and </a> (may contain <b> etc.)
+    snippet_pat = re.compile(r'class="result__snippet"[^>]*>([^<]*(?:<[^>]+>[^<]*)*?)</a>', re.I | re.S)
+    snippets = []
+    for m in snippet_pat.finditer(html):
+        raw = (m.group(1) or "").strip()
+        raw = re.sub(r"<[^>]+>", "", raw).strip()[:300]
+        snippets.append(raw)
+    for i, s in enumerate(snippets):
+        if i < len(results):
+            results[i]["snippet"] = s
+    return results[:max_results]
+
+
+def _recommend_best_search_result(query: str, results: list[dict]) -> str:
+    """Use Ollama to pick the best result and return a short recommendation (and best URL)."""
+    if not results:
+        return ""
+    lines = []
+    for i, r in enumerate(results[:8], 1):
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        snippet = (r.get("snippet") or "").strip()
+        lines.append(f"{i}. {title}\n   URL: {url}\n   {snippet[:180]}")
+    block = "\n\n".join(lines)
+    prompt = (
+        f"Search query: \"{query}\"\n\nTop results:\n{block}\n\n"
+        "Which single result is the best to recommend? Reply in 2-4 short sentences: say which one (title or number) and why. Then on a new line write exactly: BEST_URL: followed by that result's URL. Be concise."
+    )
+    try:
+        reply = ollama_chat(
+            prompt,
+            system_prompt="You are a search assistant. Pick the single best result and give its URL. Output BEST_URL: <url> on its own line.",
+            memory_scope=None,
+            message_history=None,
+        )
+        reply = (reply or "").strip()
+        if not reply:
+            return ""
+        # Extract BEST_URL if present
+        best_url = None
+        for line in reply.split("\n"):
+            line = line.strip()
+            if line.upper().startswith("BEST_URL:"):
+                best_url = line[9:].strip().strip("[]()")
+                break
+        if best_url and not best_url.startswith("http"):
+            best_url = None
+        if reply and not best_url and results:
+            best_url = results[0].get("url")
+        if best_url:
+            return reply + f"\n\n**Best link:** {best_url}"
+        return reply
+    except Exception:
+        if results:
+            r = results[0]
+            return f"Top result: **{r.get('title', '')}** — {r.get('url', '')}"
+        return ""
+
+
+def _open_google_search(query: str) -> tuple[bool, str]:
+    """Fetch results, analyze with LLM for best link, open Google in browser, return recommendation."""
+    query = (query or "").strip()
+    if not query:
+        return False, "No search query given."
+    try:
+        results = _fetch_search_results(query, max_results=10)
+        recommendation = ""
+        if results:
+            recommendation = _recommend_best_search_result(query, results)
+        url = "https://www.google.com/search?q=" + urllib.parse.quote(query, safe="")
+        webbrowser.open(url)
+        base = f"Opened Google search for **{query[:80]}{'…' if len(query) > 80 else ''}** in your browser."
+        if recommendation:
+            base = base + "\n\n" + recommendation
+        return True, base
+    except Exception as e:
+        try:
+            url = "https://www.google.com/search?q=" + urllib.parse.quote(query, safe="")
+            webbrowser.open(url)
+            return True, f"Opened Google search for **{query[:80]}{'…' if len(query) > 80 else ''}** in your browser. (Could not analyze results this time.)"
+        except Exception:
+            pass
+        return False, str(e)[:200]
+
+
+def _run_do_research_and_propose(description: str, scope: str) -> str:
+    """Search how to do it, summarize for user, propose a concrete action, store pending. User says yes -> execute."""
+    description = (description or "").strip()
+    if not description or len(description) < 3:
+        return "What should I do? Describe it (e.g. remind me to take medicine at 8pm, or back up my notes)."
+    global _pending_do_action
+    try:
+        search_query = f"how to {description}"
+        results = _fetch_search_results(search_query, max_results=8)
+        if not results:
+            return "I couldn't find any steps for that. Try rephrasing or be more specific."
+        block = "\n".join(
+            f"{i}. {r.get('title', '')} — {r.get('url', '')}\n   {r.get('snippet', '')[:150]}"
+            for i, r in enumerate(results[:6], 1)
+        )
+        prompt_summary = (
+            f"User wants: \"{description}\"\n\nSearch results:\n{block}\n\n"
+            "In 2-4 short sentences, summarize how to do this. Be clear and practical."
+        )
+        summary = ollama_chat(
+            prompt_summary,
+            system_prompt="You summarize how to do the task. Be concise.",
+            memory_scope=None,
+            message_history=None,
+        )
+        summary = (summary or "").strip()[:500]
+        if not summary:
+            summary = "Here are some ways to do it (see search results)."
+        prompt_action = (
+            f"User wants: \"{description}\"\n\nSummary: {summary}\n\n"
+            "Propose ONE concrete action Luna can take. Only these types:\n"
+            "1. WRITE_FILE — create a single file in Luna projects (path relative to Luna projects, e.g. reminders.txt or notes/reminder.txt). Use for reminders, notes, scripts.\n"
+            "2. APPEND_REMINDER — add one line to data/reminders.txt (for simple reminders).\n"
+            "Output exactly:\nACTION_TYPE: WRITE_FILE\nPATH: <path>\nCONTENT: <content>\n"
+            "or\nACTION_TYPE: APPEND_REMINDER\nLINE: <one line>\n"
+            "PATH must be under Luna projects (no absolute paths). CONTENT can be multiple lines. Be brief."
+        )
+        raw_action = ollama_chat(
+            prompt_action,
+            system_prompt="Output only ACTION_TYPE, PATH (if WRITE_FILE), CONTENT or LINE. No other text.",
+            memory_scope=None,
+            message_history=None,
+        )
+        action = {"type": None, "path": "", "content": "", "line": ""}
+        for line in (raw_action or "").strip().split("\n"):
+            line = line.strip()
+            if line.upper().startswith("ACTION_TYPE:"):
+                t = line[12:].strip().upper()
+                action["type"] = "WRITE_FILE" if "WRITE" in t else "APPEND_REMINDER" if "APPEND" in t else None
+            elif line.upper().startswith("PATH:"):
+                action["path"] = line[5:].strip().strip("'\"").replace("\\", "/")[:200]
+            elif line.upper().startswith("CONTENT:"):
+                action["content"] = line[8:].strip()
+                if action["content"].startswith('"""') or action["content"].startswith("'''"):
+                    action["content"] = action["content"][3:]
+                if action["content"].endswith('"""') or action["content"].endswith("'''"):
+                    action["content"] = action["content"][:-3]
+            elif line.upper().startswith("LINE:"):
+                action["line"] = line[5:].strip().strip("'\"").strip()[:300]
+        if not action["type"]:
+            action["type"] = "APPEND_REMINDER"
+            action["line"] = description[:200]
+        if action["type"] == "WRITE_FILE" and not action["path"]:
+            action["path"] = "reminder.txt"
+        if action["path"] and not action["path"].startswith(".") and ".." not in action["path"]:
+            action["path"] = _normalize_luna_path(action["path"]) or action["path"]
+        proposal = f"I can do this by "
+        if action["type"] == "WRITE_FILE":
+            proposal += f"creating **{action['path']}** in Luna projects with the relevant content."
+        else:
+            proposal += f"adding a reminder to **data/reminders.txt**."
+        _pending_do_action[scope] = {
+            "description": description,
+            "summary": summary,
+            "proposal": proposal,
+            "action": action,
+        }
+        return f"{summary}\n\n{proposal}\n\nReply **yes** to have me do it, or **no** to cancel."
+    except Exception as e:
+        return f"❌ Could not research that: {str(e)[:150]}"
+
+
+def _execute_pending_do_action(scope: str) -> tuple[bool, str]:
+    """Execute the stored action for this scope. Returns (ok, message). Pops pending."""
+    global _pending_do_action
+    pending = _pending_do_action.pop(scope, None)
+    if not pending or not isinstance(pending.get("action"), dict):
+        return False, "Nothing to do (or already done)."
+    action = pending["action"]
+    act_type = (action.get("type") or "").upper()
+    try:
+        if act_type == "WRITE_FILE":
+            path = (action.get("path") or "").strip()
+            content = (action.get("content") or "").strip()
+            if not path:
+                return False, "No path in action."
+            path = _normalize_luna_path(path) or path
+            ok, result = luna_write_file(path, content)
+            if not ok:
+                return False, result
+            _log_action(scope, "file_create", {"path": path})
+            _open_file_by_path(result)
+            return True, f"Done. Created **{path}** in Luna projects and opened it."
+        if act_type == "APPEND_REMINDER":
+            line = (action.get("line") or "").strip()
+            if not line:
+                line = (pending.get("description") or "").strip()[:200]
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            reminders_dir = os.path.join(base_dir, "data")
+            reminders_path = os.path.join(reminders_dir, "reminders.txt")
+            os.makedirs(reminders_dir, exist_ok=True)
+            with open(reminders_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            _log_action(scope, "reminder_append", {"path": "data/reminders.txt", "preview": line[:80]})
+            # Open the file so the user sees the real reminder list (not "fake" — it's really there)
+            try:
+                _open_file_by_path(reminders_path)
+            except Exception:
+                pass
+            return True, (
+                f"Done. Added to **data/reminders.txt** and opened it: {line[:80]}{'…' if len(line) > 80 else ''} "
+                "Set an alarm on your phone or in Windows if you want a real alert — this file is your list to check."
+            )
+        return False, "Unknown action type."
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def _run_script_in_luna_projects(relative_path: str) -> tuple[bool, str]:
+    """Run a Python script under Luna projects. Path is relative; only .py allowed. Returns (ok, output_or_error)."""
+    relative_path = (relative_path or "").strip().replace("\\", "/").lstrip("/")
+    if not relative_path:
+        return False, "No path given."
+    path = luna_safe_path(relative_path)
+    if path is None:
+        return False, "Path not allowed (only inside Luna projects)."
+    if not path.is_file():
+        return False, f"Not a file or not found: {relative_path}"
+    if path.suffix.lower() != ".py":
+        return False, "Only .py scripts can be run. Use a path like script.py or folder/script.py"
+    try:
+        cwd = str(path.parent)
+        result = subprocess.run(
+            [sys.executable, "-u", str(path)],
+            cwd=cwd,
+            timeout=_RUN_SCRIPT_TIMEOUT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        if result.returncode != 0:
+            return False, f"Exit {result.returncode}\n{err or out or 'No output'}"
+        _log_action("", "run_script", {"path": relative_path})
+        return True, out if out else "(Script ran with no output.)"
+    except subprocess.TimeoutExpired:
+        return False, f"Script timed out after {_RUN_SCRIPT_TIMEOUT}s."
+    except Exception as e:
+        return False, str(e)[:300]
 
 
 def _intent_requires_tool_call(text: str) -> bool:
@@ -2284,6 +3140,7 @@ def _run_x_share_random_song() -> tuple[bool, str]:
                 if not x_posted:
                     return False, "I typed the message, but couldn't find or click the X Post button (tried several strategies)."
                 page.wait_for_timeout(3000)
+                _log_action("", "share_x", {"song_title": (song_title or "")[:100], "song_url": (song_url or "")[:150]})
                 return True, f"Shared to X ({X_PROFILE_URL}): \"{song_title}\" — {song_url}"
         except Exception as e:
             return False, f"X share automation error: {e}"
@@ -2719,6 +3576,7 @@ def _run_facebook_share_random_song() -> tuple[bool, str]:
                 if not post_success:
                     return False, "I typed the Facebook post, but couldn't find or click the Post button in the Post settings dialog (tried several strategies)."
                 page.wait_for_timeout(500)
+                _log_action("", "share_facebook", {"song_title": (song_title or "")[:100], "song_url": (song_url or "")[:150]})
                 return True, f"Shared to Facebook ({FACEBOOK_PROFILE_URL}): \"{song_title}\" — {song_url}"
         except Exception as e:
             return False, f"Facebook share automation error: {e}"
@@ -4057,139 +4915,377 @@ def _run_whatsapp_web_open_contact(contact_name: str, message_to_send: str | Non
         if not _is_whatsapp_web_bootstrap_done():
             ok, msg = _start_whatsapp_web_first_login_window()
             return False, msg + " Then run !call or !msg again."
-        try:
-            context, page, is_new = _get_or_create_wa_web_context()
-            if is_new:
-                page.goto(WHATSAPP_WEB_URL, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(3000)
-            else:
-                page.goto(WHATSAPP_WEB_URL, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(1500)
-            qr = page.locator('canvas[aria-label*="QR"]').first
+        last_error = "unknown"
+        for attempt in range(2):
             try:
-                if qr.count() and qr.is_visible():
-                    _start_whatsapp_web_first_login_window()
-                    return False, "WhatsApp Web session expired. Luna opened the login window — scan the QR code, then try !call again."
-            except Exception:
-                pass
-            search_selectors = [
-                '[data-tab="3"]',
-                '[aria-label="Search input textbox"]',
-                '[aria-label="Search name or number"]',
-                'div[contenteditable="true"][data-tab="3"]',
-                '[contenteditable="true"][data-tab="3"]',
-                'footer + div [contenteditable="true"]',
-            ]
-            search_box = None
-            _wa_prefer = _should_prefer_longer_waits("msg") or _should_prefer_longer_waits("call")
-            _wa_search_waits = (1500, 1000, 0) if _wa_prefer else (0, 1500, 1000)
-            for wait_ms in _wa_search_waits:
-                page.wait_for_timeout(wait_ms)
-                for sel in search_selectors:
-                    loc = page.locator(sel).first
-                    try:
-                        if loc.count() and loc.is_visible():
-                            search_box = loc
-                            break
-                    except Exception:
-                        continue
-                if search_box:
-                    break
-            if not search_box:
-                return False, "Could not find the search box on WhatsApp Web (tried several strategies). Try logging in again."
-            search_box.click()
-            page.wait_for_timeout(400)
-            search_box.fill("")
-            page.wait_for_timeout(200)
-            search_box.press_sequentially(contact_name, delay=50)
-            contact_clicked = False
-            for wait_ms in (2000, 1500, 1000):
-                page.wait_for_timeout(wait_ms)
-                for sel in [
-                    f'[role="listitem"]:has-text("{contact_name}")',
-                    f'div[data-testid="cell-frame-container"]:has-text("{contact_name}")',
-                    f'span[dir="auto"]:has-text("{contact_name}")',
-                    f'[data-testid="cell-frame-container"]:has-text("{contact_name}")',
-                ]:
-                    try:
-                        row = page.locator(sel).first
-                        if row.count() and row.is_visible():
-                            row.click()
-                            contact_clicked = True
-                            break
-                    except Exception:
-                        continue
-                if contact_clicked:
-                    break
+                context, page, is_new = _get_or_create_wa_web_context()
+                if is_new:
+                    page.goto(WHATSAPP_WEB_URL, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(3000)
+                else:
+                    page.goto(WHATSAPP_WEB_URL, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(1500)
+                qr = page.locator('canvas[aria-label*="QR"]').first
                 try:
-                    page.get_by_text(contact_name, exact=False).first.click()
-                    contact_clicked = True
-                    break
+                    if qr.count() and qr.is_visible():
+                        _start_whatsapp_web_first_login_window()
+                        return False, "WhatsApp Web session expired. Luna opened the login window — scan the QR code, then try !call again."
                 except Exception:
                     pass
-            page.wait_for_timeout(800)
-            if message_to_send:
-                msg_input_selectors = [
-                    'div[contenteditable="true"][role="textbox"]',
-                    'footer [contenteditable="true"]',
-                    '[data-tab="10"]',
-                    'div[contenteditable="true"].selectable-text',
-                    'footer div[contenteditable="true"]',
-                    '[contenteditable="true"][data-tab="10"]',
+                search_selectors = [
+                    '[data-tab="3"]',
+                    '[aria-label="Search input textbox"]',
+                    '[aria-label="Search name or number"]',
+                    'div[contenteditable="true"][data-tab="3"]',
+                    '[contenteditable="true"][data-tab="3"]',
+                    'footer + div [contenteditable="true"]',
                 ]
-                sent_ok = False
-                _wa_msg_waits = (1200, 800, 0) if _wa_prefer else (0, 1200, 800)
-                for wait_ms in _wa_msg_waits:
+                search_box = None
+                _wa_prefer = _should_prefer_longer_waits("msg") or _should_prefer_longer_waits("call")
+                _wa_search_waits = (1500, 1000, 0) if _wa_prefer else (0, 1500, 1000)
+                for wait_ms in _wa_search_waits:
                     page.wait_for_timeout(wait_ms)
-                    msg_input = None
-                    for sel in msg_input_selectors:
+                    for sel in search_selectors:
                         loc = page.locator(sel).first
                         try:
                             if loc.count() and loc.is_visible():
-                                msg_input = loc
+                                search_box = loc
                                 break
                         except Exception:
                             continue
-                    if not msg_input:
-                        continue
+                    if search_box:
+                        break
+                if not search_box:
+                    return False, "Could not find the search box on WhatsApp Web (tried several strategies). Try logging in again."
+                search_box.click()
+                page.wait_for_timeout(400)
+                search_box.fill("")
+                page.wait_for_timeout(200)
+                search_box.press_sequentially(contact_name, delay=50)
+                contact_clicked = False
+                for wait_ms in (2000, 1500, 1000):
+                    page.wait_for_timeout(wait_ms)
+                    for sel in [
+                        f'[role="listitem"]:has-text("{contact_name}")',
+                        f'div[data-testid="cell-frame-container"]:has-text("{contact_name}")',
+                        f'span[dir="auto"]:has-text("{contact_name}")',
+                        f'[data-testid="cell-frame-container"]:has-text("{contact_name}")',
+                    ]:
+                        try:
+                            row = page.locator(sel).first
+                            if row.count() and row.is_visible():
+                                row.click()
+                                contact_clicked = True
+                                break
+                        except Exception:
+                            continue
+                    if contact_clicked:
+                        break
                     try:
-                        msg_input.click()
-                        page.wait_for_timeout(300)
-                        msg_input.fill("")
-                        page.wait_for_timeout(100)
-                        msg_input.press_sequentially(message_to_send, delay=30)
-                        page.wait_for_timeout(400)
-                        for send_sel in ('[data-testid="send"]', '[data-icon="send"]', '[aria-label="Send"]'):
-                            send_btn = page.locator(send_sel).first
-                            try:
-                                if send_btn.count() and send_btn.is_visible():
-                                    send_btn.click()
-                                    sent_ok = True
-                                    break
-                            except Exception:
-                                continue
-                        if not sent_ok:
-                            page.keyboard.press("Enter")
-                            sent_ok = True
-                        if sent_ok:
-                            page.wait_for_timeout(500)
-                            return True, f"Sent to **{contact_name}**: \"{message_to_send[:50]}{'…' if len(message_to_send) > 50 else ''}\". Window left open."
+                        page.get_by_text(contact_name, exact=False).first.click()
+                        contact_clicked = True
+                        break
                     except Exception:
-                        continue
-                if not sent_ok:
-                    return True, f"Opened chat with **{contact_name}** but couldn't send the message (tried several strategies). Window left open."
-            return True, f"Opened chat with **{contact_name}**. Window left open."
-        except Exception as e:
-            err = (str(e) or "unknown")[:200]
-            return False, f"WhatsApp Web error: {err}"
+                        pass
+                page.wait_for_timeout(800)
+                if message_to_send:
+                    # Prefer the chat message box (placeholder "Type a message"), NOT the left-pane search bar
+                    msg_input_selectors = [
+                        '[data-placeholder="Type a message"]',
+                        'div[contenteditable="true"][data-placeholder="Type a message"]',
+                        'footer div[contenteditable="true"][data-placeholder="Type a message"]',
+                        'footer [contenteditable="true"]',  # chat footer (only one with contenteditable in footer)
+                        '[contenteditable="true"][data-tab="10"]',
+                        'div[contenteditable="true"].selectable-text',
+                        'footer div[contenteditable="true"]',
+                        '[data-tab="10"]',
+                        'div[contenteditable="true"][role="textbox"]',
+                    ]
+                    sent_ok = False
+                    _wa_msg_waits = (1200, 800, 0) if _wa_prefer else (0, 1200, 800)
+                    for wait_ms in _wa_msg_waits:
+                        page.wait_for_timeout(wait_ms)
+                        msg_input = None
+                        # First try: explicit "Type a message" box (chat input, not search)
+                        try:
+                            pl = page.get_by_placeholder("Type a message")
+                            if pl.count() and pl.first.is_visible():
+                                msg_input = pl.first
+                        except Exception:
+                            pass
+                        if not msg_input:
+                            for sel in msg_input_selectors:
+                                loc = page.locator(sel).first
+                                try:
+                                    if loc.count() and loc.is_visible():
+                                        # Skip if this is the search box (left pane)
+                                        aria = loc.get_attribute("aria-label") or ""
+                                        if "search" in aria.lower() or "search" in (loc.get_attribute("data-tab") or ""):
+                                            continue
+                                        msg_input = loc
+                                        break
+                                except Exception:
+                                    continue
+                        if not msg_input:
+                            continue
+                        try:
+                            msg_input.click()
+                            page.wait_for_timeout(300)
+                            msg_input.fill("")
+                            page.wait_for_timeout(100)
+                            msg_input.press_sequentially(message_to_send, delay=30)
+                            page.wait_for_timeout(400)
+                            for send_sel in ('[data-testid="send"]', '[data-icon="send"]', '[aria-label="Send"]'):
+                                send_btn = page.locator(send_sel).first
+                                try:
+                                    if send_btn.count() and send_btn.is_visible():
+                                        send_btn.click()
+                                        sent_ok = True
+                                        break
+                                except Exception:
+                                    continue
+                            if not sent_ok:
+                                page.keyboard.press("Enter")
+                                sent_ok = True
+                            if sent_ok:
+                                page.wait_for_timeout(500)
+                                return True, f"Sent to **{contact_name}**: \"{message_to_send[:50]}{'…' if len(message_to_send) > 50 else ''}\". Window left open."
+                        except Exception:
+                            continue
+                    if not sent_ok:
+                        return True, f"Opened chat with **{contact_name}** but couldn't send the message (tried several strategies). Window left open."
+                return True, f"Opened chat with **{contact_name}**. Window left open."
+            except Exception as e:
+                last_error = str(e) or "unknown"
+                err_lower = last_error.lower()
+                if attempt == 0 and ("cannot switch to a different thread" in last_error or "exited" in err_lower):
+                    _clear_wa_web_context()
+                    continue
+                return False, f"WhatsApp Web error: {last_error[:200]}"
+        return False, f"WhatsApp Web error: {last_error[:200] if last_error else 'unknown'}"
+
+
+def _get_whatsapp_desktop_exe() -> str | None:
+    """Return path to WhatsApp Desktop exe on Windows, or None if not found (fallback when Start menu launch fails)."""
+    if sys.platform != "win32":
+        return None
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if not localappdata:
+        return None
+    candidates = [
+        os.path.join(localappdata, "WhatsApp", "WhatsApp.exe"),
+        os.path.join(localappdata, "Programs", "WhatsApp", "WhatsApp.exe"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _launch_whatsapp_via_start_search_ui() -> bool:
+    """Launch WhatsApp by opening Start search, typing 'whatsApp', and pressing Enter (same place user finds the app)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        from pywinauto import Application
+    except ImportError:
+        return False
+    try:
+        VK_LWIN = 0x5B
+        KEYEVENTF_KEYUP = 0x0002
+        INPUT_KEYBOARD = 1
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_ulong), ("ki", KEYBDINPUT)]
+        down = INPUT(INPUT_KEYBOARD, KEYBDINPUT(VK_LWIN, 0, 0, 0, None))
+        up = INPUT(INPUT_KEYBOARD, KEYBDINPUT(VK_LWIN, 0, KEYEVENTF_KEYUP, 0, None))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
+        time.sleep(0.08)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(INPUT))
+    except Exception:
+        return False
+    time.sleep(0.9)
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        app = Application(backend="uia").connect(handle=hwnd)
+        win = app.window(handle=hwnd)
+        win.set_focus()
+        win.type_keys("whatsapp", with_spaces=False)
+        time.sleep(1.4)
+        win.type_keys("{ENTER}")
+        return True
+    except Exception:
+        return False
+
+
+def _launch_whatsapp_via_start_menu() -> bool:
+    """Launch WhatsApp via Windows Start: open Start search, type 'whatsApp', Enter (same UI as user). Fallback: Start-Process then exe."""
+    if sys.platform != "win32":
+        return False
+    if _launch_whatsapp_via_start_search_ui():
+        return True
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Process 'WhatsApp'"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+        return True
+    except Exception:
+        pass
+    exe = _get_whatsapp_desktop_exe()
+    if exe:
+        try:
+            subprocess.Popen([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=os.path.dirname(exe))
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _run_whatsapp_desktop_call(contact_name: str) -> tuple[bool, str]:
+    """Open WhatsApp Desktop (via Start menu if needed), search contact, then find and click Call then Voice. Uses pywinauto (Windows)."""
+    if sys.platform != "win32":
+        return False, "WhatsApp Desktop call is only supported on Windows."
+    try:
+        from pywinauto import Application
+        from pywinauto.findwindows import ElementNotFoundError
+    except ImportError:
+        return False, "Install pywinauto for desktop call: pip install pywinauto"
+    contact_name = (contact_name or "").strip()
+    if not contact_name:
+        return False, "Please provide a contact name (e.g. Marios)."
+    try:
+        # If already open: connect to existing window by title
+        app = None
+        try:
+            app = Application(backend="uia").connect(title_re=".*WhatsApp.*", timeout=3)
+        except Exception:
+            pass
+        if app is None:
+            # Not running: launch via Start menu (or exe fallback)
+            if not _launch_whatsapp_via_start_menu():
+                return False, "Could not start WhatsApp (Start menu or exe). Install WhatsApp Desktop and try again."
+            time.sleep(4)
+            try:
+                app = Application(backend="uia").connect(title_re=".*WhatsApp.*", timeout=15)
+            except Exception as e:
+                return False, f"WhatsApp did not open in time: {e}"
+        win = app.window(title_re=".*WhatsApp.*")
+        win.wait("ready", timeout=5)
+        win.restore()
+        win.set_focus()
+        time.sleep(0.5)
+
+        # Search for contact: find search box and type name
+        try:
+            search = win.child_window(title_re=".*Search.*", control_type="Edit")
+            search.wait("ready", timeout=3)
+            search.set_focus()
+            search.set_edit_text("")
+            time.sleep(0.2)
+            search.type_keys(contact_name, with_spaces=True)
+            time.sleep(1.2)
+            win.type_keys("{ENTER}")
+            time.sleep(1.0)
+        except (ElementNotFoundError, Exception):
+            for c in win.descendants(control_type="Edit"):
+                try:
+                    c.set_focus()
+                    c.set_edit_text("")
+                    time.sleep(0.2)
+                    c.type_keys(contact_name, with_spaces=True)
+                    time.sleep(1.2)
+                    win.type_keys("{ENTER}")
+                    time.sleep(1.0)
+                    break
+                except Exception:
+                    continue
+
+        # Search for Call button until found (then click)
+        call_clicked = False
+        call_names = ("Call", "Phone", "call", "phone", "Voice call", "Video call")
+        for _ in range(20):
+            time.sleep(0.5)
+            for name in call_names:
+                try:
+                    btn = win.child_window(title_re=f".*{name}.*", control_type="Button")
+                    if btn.exists(timeout=0):
+                        btn.click_input()
+                        call_clicked = True
+                        break
+                except Exception:
+                    continue
+            if call_clicked:
+                break
+            for desc in win.descendants(control_type="Button"):
+                try:
+                    t = (desc.window_text() or "").lower()
+                    if "call" in t or "phone" in t:
+                        desc.click_input()
+                        call_clicked = True
+                        break
+                except Exception:
+                    continue
+            if call_clicked:
+                break
+        if not call_clicked:
+            return False, "Could not find the Call button in WhatsApp Desktop. Open the chat and try the call from the app."
+        time.sleep(1.0)
+
+        # Search for Voice button until found (then click)
+        voice_clicked = False
+        voice_names = ("Voice", "Voice call", "voice", "Voice Call")
+        for _ in range(20):
+            time.sleep(0.5)
+            for name in voice_names:
+                try:
+                    btn = win.child_window(title_re=f".*{name}.*", control_type="Button")
+                    if btn.exists(timeout=0):
+                        btn.click_input()
+                        voice_clicked = True
+                        break
+                except Exception:
+                    continue
+            if voice_clicked:
+                break
+            for desc in win.descendants(control_type="Button"):
+                try:
+                    if "voice" in (desc.window_text() or "").lower():
+                        desc.click_input()
+                        voice_clicked = True
+                        break
+                except Exception:
+                    continue
+            if voice_clicked:
+                break
+        if not voice_clicked:
+            return True, f"Opened call menu for **{contact_name}** but could not find Voice button — please click Voice call yourself."
+        return True, f"Started voice call with **{contact_name}** in WhatsApp Desktop."
+    except Exception as e:
+        return False, f"WhatsApp Desktop error: {e}"
 
 
 def _run_whatsapp_web_call(contact_name: str) -> tuple[bool, str]:
-    """WhatsApp Web doesn't support voice calls (prompts desktop app). Just open the chat like !msg."""
-    ok, msg = _run_whatsapp_web_open_contact(contact_name)
-    if not ok:
+    """Try WhatsApp Desktop first (open app, find Call then Voice). Fall back to opening chat on Web if desktop fails."""
+    ok, msg = _run_whatsapp_desktop_call(contact_name)
+    if ok:
         return ok, msg
-    return True, f"Opened chat with **{contact_name}**. Voice calls need the WhatsApp desktop app — use it from there. Window left open."
+    # Fallback: open chat on Web so user can call manually
+    ok_web, msg_web = _run_whatsapp_web_open_contact(contact_name)
+    if not ok_web:
+        return ok_web, msg_web
+    return True, f"{msg} Opened chat with **{contact_name}** on WhatsApp Web so you can call from there."
 
 
 def _run_whatsapp_web_msg(contact_name: str, description: str | None = None) -> tuple[bool, str]:
@@ -4651,6 +5747,16 @@ _last_automation_params: dict = {}
 # Pending file creation: scope -> {path, content}. User must reply "yes" to confirm (admin only on Discord).
 _pending_writes: dict[str, dict] = {}
 
+# Pending "do something": scope -> {description, summary, proposal, action}. User says yes -> Luna executes.
+_pending_do_action: dict[str, dict] = {}
+
+# Pending "run script": scope -> {path}. User says yes -> Luna runs the .py file in Luna projects.
+_pending_run: dict[str, dict] = {}
+_RUN_SCRIPT_TIMEOUT = 120  # seconds
+
+# Pending "record to identity file": scope -> "SOUL"|"TOOLS"|"OBJECTIVES". Next user message is saved to that file (like profile).
+_pending_file_update: dict[str, str] = {}
+
 # Phrases that count as "yes, create the file" (for web and Discord)
 _CONFIRM_PHRASES = frozenset({
     "yes", "y", "confirm", "confirmed", "ok", "okay", "do it", "go ahead",
@@ -4859,6 +5965,11 @@ LUNA_COMMANDS_REPLY = (
     "• !list [path] — list directory\n"
     "• !edit <path> <old> -> <new> — replace text in file\n"
     "• !news — latest world news headlines\n"
+    "• !search <query> / \"search for …\" / \"google …\" — open Google and search\n"
+    "• !agent create <description> / \"create an agent that …\" — create a small agent from your description\n"
+    "• !agents / \"list my agents\" — list your small agents (Luna can use or recommend them)\n"
+    "• \"do …\" / \"can you …\" — Luna searches how to do it, describes it, then you say yes and she does it\n"
+    "• !run <path> / \"run script.py\" — run a .py script in Luna projects (confirm with yes)\n"
     "• !suno <description> — open Suno and create a song\n"
     "• !local_song <description> — generate local instrumental + lyrics files\n"
     "• !share_song (or !share song) — share a random YouTube channel song to X\n"
@@ -4869,7 +5980,7 @@ LUNA_COMMANDS_REPLY = (
     "• !remember / !always_remember — store memories\n"
     "• !profile — view or set your profile\n"
     "• !join / !leave — voice; !play / !pause / !skip / !stop / !queue — music\n"
-    "• !call <contact> — WhatsApp Web: open chat with contact (voice calls need desktop app)\n"
+    "• !call <contact> — WhatsApp Desktop: open app, find Call then Voice to start voice call (Windows)\n"
     "• !msg <contact> [description] — WhatsApp Web: open chat and send message (default or your text, from Luna)"
 )
 
@@ -4891,6 +6002,11 @@ Commands and their JSON shape (use these keys only):
 - Read a file in Luna projects: {"command": "read", "path": "<path>"}
 - List files in Luna projects: {"command": "list", "path": "<optional path>"}
 - Write content to a file in Luna projects: {"command": "write", "path": "<path>", "content": "<text>"}
+- Open Google and search for something (e.g. search for X, google X, look up X): {"command": "search", "query": "<search terms>"}
+- Do something / perform a task (user describes what they want, e.g. remind me to take medicine at 8pm): {"command": "do", "description": "<what they want done>"}
+- Run a Python script in Luna projects (e.g. run script.py, execute my_script.py): {"command": "run", "path": "<path to .py file>"}
+- Create a small agent with a description (e.g. create an agent that reminds me to drink water): {"command": "agent_create", "description": "<what the agent should do>"}
+- List my agents / show my agents: {"command": "agent_list"}
 - Show commands / help / what can you do: {"command": "files"}
 - Join voice channel: {"command": "join"}
 - Leave voice: {"command": "leave"}
@@ -4931,8 +6047,8 @@ def _parse_natural_language_command(msg: str) -> tuple[str, dict] | None:
         return None
 
 
-def _run_parsed_command(cmd: str, params: dict) -> str:
-    """Execute a parsed command (from NL or internal) and return the reply text."""
+def _run_parsed_command(cmd: str, params: dict, scope: str | None = None) -> str:
+    """Execute a parsed command (from NL or internal) and return the reply text. scope needed for 'do' (pending action)."""
     cmd = (cmd or "").strip().lower()
     p = params or {}
     if cmd == "msg":
@@ -4960,6 +6076,49 @@ def _run_parsed_command(cmd: str, params: dict) -> str:
             _record_automation_failure(cmd, result, p)
             return f"❌ {result}"
         return result
+    if cmd == "search":
+        query = (p.get("query") or "").strip()
+        if not query:
+            return "What should I search for? (e.g. search for best pizza near me, or google how to fix a bike)"
+        ok, result = _open_google_search(query)
+        if not ok:
+            return f"❌ {result}"
+        return f"✅ {result}"
+    if cmd == "do":
+        desc = (p.get("description") or "").strip()
+        if not desc:
+            return "What should I do? Describe it (e.g. remind me to take medicine at 8pm)."
+        if not scope:
+            return "Say that in the chat and I'll search how to do it, describe it, and ask you to confirm before I do it."
+        return _run_do_research_and_propose(desc, scope)
+    if cmd == "run":
+        path = (p.get("path") or "").strip().replace("\\", "/").lstrip("/")
+        if not path:
+            return "Which script? Give a path in Luna projects (e.g. script.py or tools/run.py)."
+        if not path.lower().endswith(".py"):
+            path = path.rstrip("/") + ".py" if not path.endswith(".py") else path
+        if not scope:
+            return "Say that in the chat and I'll ask you to confirm before running the script."
+        _pending_run[scope] = {"path": path}
+        return f"Run **{path}** in Luna projects? Reply **yes** to run it, or **no** to cancel."
+    if cmd == "agent_create":
+        desc = (p.get("description") or "").strip()
+        if not desc:
+            return "Describe what the agent should do (e.g. create an agent that reminds me to drink water every hour)."
+        ok, result = _create_agent(desc)
+        if not ok:
+            return f"❌ {result}"
+        return f"✅ {result}"
+    if cmd == "agent_list":
+        agents = _list_agents()
+        if not agents:
+            return "You have no agents yet. Say \"create an agent that …\" to add one."
+        lines = ["**Your agents:**"]
+        for a in agents:
+            name = (a.get("name") or "").strip() or "Agent"
+            desc = (a.get("description") or a.get("instructions") or "").strip()
+            lines.append(f"• **{name}**: {desc[:100]}{'…' if len(desc) > 100 else ''}")
+        return "\n".join(lines)
     if cmd == "play":
         return "Use !play <song or url> in Discord when I'm in a voice channel to play music."
     if cmd == "suno":
@@ -5200,7 +6359,7 @@ def _is_nl_command_allowed_on_discord(cmd: str, author_id: int) -> bool:
         return _can_use_instagram_dm_discord(author_id)
     if cmd == "fb_msg":
         return _can_use_messenger_discord(author_id)
-    if cmd in ("read", "list", "write", "edit"):
+    if cmd in ("read", "list", "write", "edit", "run"):
         return _discord_admin_id_int is not None and author_id == _discord_admin_id_int
     return True
 
@@ -5297,6 +6456,27 @@ def _handle_web_file_command(msg: str) -> str | None:
     if cmd == "!news":
         ok, result = _fetch_world_news()
         return result if ok else f"❌ {result}"
+    if cmd == "!search":
+        if not args:
+            return "Usage: !search <query> (e.g. !search best pizza near me)"
+        ok, result = _open_google_search(args)
+        return f"✅ {result}" if ok else f"❌ {result}"
+    if cmd == "!agents":
+        agents = _list_agents()
+        if not agents:
+            return "You have no agents yet. Use \"create an agent that …\" or !agent create <description>."
+        lines = ["**Your agents:**"]
+        for a in agents:
+            name = (a.get("name") or "").strip() or "Agent"
+            desc = (a.get("description") or a.get("instructions") or "").strip()
+            lines.append(f"• **{name}**: {desc[:100]}{'…' if len(desc) > 100 else ''}")
+        return "\n".join(lines)
+    if cmd == "!agent" and args.lower().startswith("create"):
+        desc = args[7:].strip()  # skip "create "
+        if not desc:
+            return "Usage: !agent create <description> (e.g. !agent create reminds me to drink water every hour)"
+        ok, result = _create_agent(desc)
+        return f"✅ {result}" if ok else f"❌ {result}"
     if cmd == "!suno":
         if not args:
             return "Usage: !suno <song description>"
@@ -5390,6 +6570,29 @@ def _handle_web_file_command(msg: str) -> str | None:
     return None
 
 
+def _path_for_identity_file(key: str) -> str | None:
+    """Return the data/ path for SOUL, TOOLS, or OBJECTIVES."""
+    if key == "SOUL":
+        return _SOUL_PATH
+    if key == "TOOLS":
+        return _TOOLS_PATH
+    if key == "OBJECTIVES":
+        return _OBJECTIVES_PATH
+    return None
+
+
+def _save_identity_file_and_clear_pending(scope: str) -> tuple[str, str] | None:
+    """If scope has a pending file update, return (file_key, path); caller writes content and then clears."""
+    key = _pending_file_update.get(scope)
+    if not key:
+        return None
+    path = _path_for_identity_file(key)
+    if not path:
+        _pending_file_update.pop(scope, None)
+        return None
+    return key, path
+
+
 @web_app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.get_json(force=True, silent=True) or {}
@@ -5398,7 +6601,38 @@ def api_chat():
         return jsonify({"error": "Missing message"}), 400
     # Web UI uses linked scope (Chris/Solonaras) so same memory, profile, conversation as Discord
     scope = LINKED_SCOPE if LINKED_SCOPE else "web"
-    # Confirmation: user said yes -> execute pending write, then open file in Notepad/default app
+    # Pending "record to SOUL/TOOLS/OBJECTIVES": user's message is the content to save (like profile)
+    pending = _save_identity_file_and_clear_pending(scope)
+    if pending:
+        key, path = pending
+        _pending_file_update.pop(scope, None)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(msg)
+            name = {"SOUL": "SOUL.md", "TOOLS": "TOOLS.md", "OBJECTIVES": "OBJECTIVES.md"}[key]
+            reply = f"Saved to **{name}**. I'll use that from now on."
+        except Exception as e:
+            reply = f"Couldn't save to {key}: {e}"
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
+    # Confirmation: user said yes -> run pending script, execute pending "do" action, or pending write
+    if _is_confirm_message(msg) and scope and scope in _pending_run:
+        pending = _pending_run.pop(scope, None)
+        if pending and pending.get("path"):
+            ok, output = _run_script_in_luna_projects(pending["path"])
+            reply = f"✅ **Output:**\n```\n{output[:1900]}{'…' if len(output) > 1900 else ''}\n```" if ok else f"❌ {output}"
+        else:
+            reply = "Nothing to run."
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
+    if _is_confirm_message(msg) and scope and scope in _pending_do_action:
+        ok, reply = _execute_pending_do_action(scope)
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
     pending_scope = scope if scope in _pending_writes else _pending_write_scope_for_web()
     if _is_confirm_message(msg) and pending_scope is not None:
         pending = _pending_writes.pop(pending_scope)
@@ -5409,6 +6643,7 @@ def api_chat():
             ok, result = luna_write_file(e["path"], e["content"])
             if ok:
                 created_paths.append(result)
+                _log_action(pending_scope, "file_create", {"path": e["path"]})
                 print(f"[Luna] File written to: {result}", flush=True)
                 _open_file_by_path(result)
             else:
@@ -5428,13 +6663,36 @@ def api_chat():
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
     msg_lower = (msg or "").strip().lower()
-    if msg_lower in ("no", "cancel") and (scope in _pending_writes or _pending_write_scope_for_web() is not None):
-        pop_scope = scope if scope in _pending_writes else _pending_write_scope_for_web()
-        if pop_scope:
-            _pending_writes.pop(pop_scope, None)
-        reply = "Cancelled."
+    if msg_lower.startswith("!run"):
+        path = msg.strip()[4:].strip().replace("\\", "/").lstrip("/")
+        if not path:
+            reply = "Usage: !run <path> (e.g. !run script.py) — path relative to Luna projects. Reply **yes** to run."
+        else:
+            if not path.lower().endswith(".py"):
+                path = path.rstrip("/") + ".py"
+            _pending_run[scope] = {"path": path}
+            reply = f"Run **{path}** in Luna projects? Reply **yes** to run it, or **no** to cancel."
         append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
+    if msg_lower in ("no", "cancel"):
+        if scope and scope in _pending_run:
+            _pending_run.pop(scope, None)
+            reply = "Cancelled."
+            append_exchange(scope, msg, reply)
+            return jsonify({"reply": reply})
+        if scope and scope in _pending_do_action:
+            _pending_do_action.pop(scope, None)
+            reply = "Cancelled."
+            append_exchange(scope, msg, reply)
+            return jsonify({"reply": reply})
+        if scope in _pending_writes or _pending_write_scope_for_web() is not None:
+            pop_scope = scope if scope in _pending_writes else _pending_write_scope_for_web()
+            if pop_scope:
+                _pending_writes.pop(pop_scope, None)
+            reply = "Cancelled."
+            append_exchange(scope, msg, reply)
+            return jsonify({"reply": reply})
     # Explicit ! commands in browser always execute directly.
     file_reply = _handle_web_file_command(msg)
     if file_reply is not None:
@@ -5456,7 +6714,7 @@ def api_chat():
         parsed = _parse_natural_language_command(msg)
         if parsed:
             cmd_key, cmd_params = parsed
-            reply = _run_parsed_command(cmd_key, cmd_params)
+            reply = _run_parsed_command(cmd_key, cmd_params, scope)
             if reply:
                 append_exchange(scope, msg, reply)
                 _play_reply_tts_on_pc(reply)
@@ -5533,8 +6791,9 @@ def api_chat():
         _try_capture_profile(scope, msg)
         _play_reply_tts_on_pc(command_reply)
         return jsonify({"reply": command_reply})
-    # Use persisted conversation history so context survives restarts and page refresh
-    history = get_recent_conversation(scope, 20)
+    # Use persisted conversation history; compact old messages into a summary when long (OpenClaw-style)
+    history = get_recent_conversation(scope, 40)
+    history = _compact_conversation_history(history)
     last_assistant = ""
     for h in reversed(history):
         if (h.get("role") or "").lower() == "assistant":
@@ -5542,6 +6801,12 @@ def api_chat():
             break
     try_capture_profile_from_reply(scope, last_assistant, msg)
     reply = ollama_chat(msg, LUNA_SYSTEM_PROMPT, scope, history)
+    # If Luna asked to record the next message to SOUL/TOOLS/OBJECTIVES, set pending and strip the marker from reply
+    for marker, key in (("LUNA_RECORD_SOUL", "SOUL"), ("LUNA_RECORD_TOOLS", "TOOLS"), ("LUNA_RECORD_OBJECTIVES", "OBJECTIVES")):
+        if marker in reply:
+            _pending_file_update[scope] = key
+            reply = re.sub(r"\s*" + re.escape(marker) + r"\s*", "\n", reply).strip()
+            break
     cleaned, writes = _parse_luna_writes(reply)
     if not writes and _user_wants_file_creation(msg):
         writes = _extract_code_blocks_from_reply(reply)
@@ -5556,6 +6821,7 @@ def api_chat():
     else:
         reply = cleaned
     append_exchange(scope, msg, reply)
+    threading.Thread(target=_maybe_update_user_style, args=(scope,), daemon=True).start()
     _try_capture_memory(scope, msg)
     _try_capture_profile(scope, msg)
     _play_reply_tts_on_pc(reply)
@@ -5606,6 +6872,58 @@ def api_tts_stop():
     return jsonify({"ok": True})
 
 
+def _transcribe_audio_with_whisper(audio_path: str) -> str | None:
+    """Transcribe audio file (e.g. .webm, .wav) using Whisper. Returns None if Whisper not available or error."""
+    try:
+        import whisper
+        model = getattr(_transcribe_audio_with_whisper, "_whisper_model", None)
+        if model is None:
+            model = whisper.load_model("base")
+            _transcribe_audio_with_whisper._whisper_model = model
+        result = model.transcribe(audio_path, fp16=False, language=None)
+        return (result.get("text") or "").strip()
+    except Exception as e:
+        print(f"[Luna] Whisper transcribe error: {e}", flush=True)
+        return None
+
+
+@web_app.route("/api/transcribe", methods=["POST"])
+def api_transcribe():
+    """Accept recorded audio (e.g. audio/webm), transcribe with Whisper, return { \"text\": \"...\" }. Browser keeps recording until user clicks stop."""
+    raw = request.get_data()
+    if not raw or len(raw) < 100:
+        return jsonify({"error": "No audio data or too short."}), 400
+    suffix = ".webm"
+    content_type = (request.content_type or "").lower()
+    if "wav" in content_type or request.headers.get("X-Audio-Format") == "wav":
+        suffix = ".wav"
+    fd = path = None
+    try:
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        os.write(fd, raw)
+        os.close(fd)
+        fd = None
+        text = _transcribe_audio_with_whisper(path)
+        if text is not None:
+            return jsonify({"text": text})
+        return (
+            jsonify({
+                "error": "Server-side transcription not available. Install: pip install openai-whisper and have ffmpeg in PATH."
+            }),
+            503,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)[:200]}), 500
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+            if path and os.path.isfile(path):
+                os.unlink(path)
+        except Exception:
+            pass
+
+
 def run_web_ui():
     web_app.run(host="127.0.0.1", port=5050, use_reloader=False, threaded=True)
 
@@ -5620,6 +6938,53 @@ def open_web_ui_in_browser():
 def is_mentioning_luna(message: discord.Message) -> bool:
     """True if the message mentions this bot."""
     return bot.user and (bot.user.mentioned_in(message) or message.author == bot.user)
+
+
+async def _ensure_voice_and_speak(guild: discord.Guild, reply: str) -> None:
+    """If Luna is in a voice channel on this guild, speak reply via TTS. If channel is in DISCORD_TTS_CHANNEL_IDS and we're not in voice, try to join a voice channel then speak."""
+    vc = next((c for c in bot.voice_clients if c.guild == guild and c.is_connected()), None)
+    if not vc:
+        return
+    reply_clean = _reply_text_for_tts(reply)
+    if not reply_clean or len(reply_clean) > 500:
+        return
+    mp3_bytes = await _get_tts_for_discord(reply_clean)
+    if not mp3_bytes:
+        if reply_clean:
+            print("Discord voice TTS: gTTS produced no audio.")
+        return
+    try:
+        source = discord.FFmpegPCMAudio(io.BytesIO(mp3_bytes), pipe=True)
+        vc.play(source)
+    except Exception as e:
+        print(f"Discord voice play: {e}")
+
+
+async def _auto_join_voice_for_guild(guild: discord.Guild) -> discord.VoiceClient | None:
+    """Join a voice channel on this guild. Prefer author's channel, then 'General' (or similar), then first with members. Returns voice client or None."""
+    vc = next((c for c in bot.voice_clients if c.guild == guild and c.is_connected()), None)
+    if vc:
+        return vc
+    channel = None
+    for ch in guild.voice_channels:
+        name_lower = (ch.name or "").lower()
+        if "general" in name_lower:
+            channel = ch
+            break
+    if not channel:
+        for ch in guild.voice_channels:
+            members = [m for m in ch.members if not m.bot]
+            if members:
+                channel = ch
+                break
+    if not channel and guild.voice_channels:
+        channel = guild.voice_channels[0]
+    if not channel:
+        return None
+    try:
+        return await channel.connect()
+    except (discord.ClientException, Exception):
+        return None
 
 
 @bot.event
@@ -5650,8 +7015,41 @@ async def on_message(message: discord.Message):
         memory_scope = _scope_for_discord_user(message.author.id, message.guild.id if message.guild else None)
         is_discord_admin = message.author.id == _discord_admin_id_int
         text_lower = text.lower().strip()
-        # Pending file creation: only admin can confirm on Discord; then we write and open file
+        # Pending "record to SOUL/TOOLS/OBJECTIVES": user's message is the content to save (like profile)
+        pending = _save_identity_file_and_clear_pending(memory_scope)
+        if pending:
+            key, path = pending
+            _pending_file_update.pop(memory_scope, None)
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                name = {"SOUL": "SOUL.md", "TOOLS": "TOOLS.md", "OBJECTIVES": "OBJECTIVES.md"}[key]
+                reply = f"Saved to **{name}**. I'll use that from now on."
+            except Exception as e:
+                reply = f"Couldn't save to {key}: {e}"
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        # Pending run script: user said yes -> run .py in Luna projects
         is_confirm = _is_confirm_message(text)
+        if is_confirm and memory_scope in _pending_run:
+            pending = _pending_run.pop(memory_scope, None)
+            if pending and pending.get("path"):
+                ok, output = await asyncio.to_thread(_run_script_in_luna_projects, pending["path"])
+                reply = f"✅ **Output:**\n```\n{output[:1900]}{'…' if len(output) > 1900 else ''}\n```" if ok else f"❌ {output}"
+            else:
+                reply = "Nothing to run."
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        # Pending "do" action: user said yes -> execute
+        if is_confirm and memory_scope in _pending_do_action:
+            ok, reply = await asyncio.to_thread(_execute_pending_do_action, memory_scope)
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        # Pending file creation: only admin can confirm on Discord; then we write and open file
         if is_confirm and memory_scope in _pending_writes:
             if is_discord_admin and _discord_admin_id_int is not None:
                 pending = _pending_writes.pop(memory_scope)
@@ -5662,6 +7060,7 @@ async def on_message(message: discord.Message):
                     ok, result = await asyncio.to_thread(luna_write_file, e["path"], e["content"])
                     if ok:
                         created_paths.append(result)
+                        _log_action(memory_scope, "file_create", {"path": e["path"]})
                         print(f"[Luna] File written to: {result}", flush=True)
                         await asyncio.to_thread(_open_file_by_path, result)
                     else:
@@ -5683,12 +7082,25 @@ async def on_message(message: discord.Message):
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
-        if text_lower in ("no", "cancel") and memory_scope in _pending_writes:
-            _pending_writes.pop(memory_scope, None)
-            reply = "Cancelled."
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
+        if text_lower in ("no", "cancel"):
+            if memory_scope in _pending_run:
+                _pending_run.pop(memory_scope, None)
+                reply = "Cancelled."
+                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                await message.reply(f"{mention} {reply}")
+                return
+            if memory_scope in _pending_do_action:
+                _pending_do_action.pop(memory_scope, None)
+                reply = "Cancelled."
+                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                await message.reply(f"{mention} {reply}")
+                return
+            if memory_scope in _pending_writes:
+                _pending_writes.pop(memory_scope, None)
+                reply = "Cancelled."
+                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                await message.reply(f"{mention} {reply}")
+                return
         # OpenClaw-style: "why did you make a mistake?" / "retry and find the solution"
         if _is_why_mistake_request(text):
             reply = await asyncio.to_thread(_handle_why_mistake)
@@ -5706,7 +7118,7 @@ async def on_message(message: discord.Message):
             if parsed:
                 cmd_key, cmd_params = parsed
                 if _is_nl_command_allowed_on_discord(cmd_key, message.author.id):
-                    reply = await asyncio.to_thread(_run_parsed_command, cmd_key, cmd_params)
+                    reply = await asyncio.to_thread(_run_parsed_command, cmd_key, cmd_params, memory_scope)
                     if reply:
                         await asyncio.to_thread(append_exchange, memory_scope, text, reply)
                         await message.reply(f"{mention} {reply}")
@@ -5719,6 +7131,57 @@ async def on_message(message: discord.Message):
         if _extract_news_request(text):
             ok, result = await asyncio.to_thread(_fetch_world_news)
             reply = result if ok else f"❌ {result}"
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        if text.strip().lower().startswith("!search"):
+            query = text.strip()[7:].strip()
+            if not query:
+                reply = "Usage: `!search <query>` (e.g. !search best pizza near me)"
+            else:
+                ok, result = await asyncio.to_thread(_open_google_search, query)
+                reply = f"✅ {result}" if ok else f"❌ {result}"
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        if text.strip().lower().startswith("!run"):
+            if not is_discord_admin:
+                reply = "Only the server admin can run scripts in Luna projects."
+                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                await message.reply(f"{mention} {reply}")
+                return
+            path = text.strip()[4:].strip().replace("\\", "/").lstrip("/")
+            if not path:
+                reply = "Usage: `!run <path>` (e.g. !run script.py) — path relative to Luna projects. Reply **yes** to run."
+            else:
+                if not path.lower().endswith(".py"):
+                    path = path.rstrip("/") + ".py"
+                _pending_run[memory_scope] = {"path": path}
+                reply = f"Run **{path}** in Luna projects? Reply **yes** to run it, or **no** to cancel."
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        if text.strip().lower().startswith("!agents"):
+            agents = await asyncio.to_thread(_list_agents)
+            if not agents:
+                reply = "You have no agents yet. Use \"create an agent that …\" or `!agent create <description>`."
+            else:
+                lines = ["**Your agents:**"]
+                for a in agents:
+                    name = (a.get("name") or "").strip() or "Agent"
+                    desc = (a.get("description") or a.get("instructions") or "").strip()
+                    lines.append(f"• **{name}**: {desc[:100]}{'…' if len(desc) > 100 else ''}")
+                reply = "\n".join(lines)
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        if text.strip().lower().startswith("!agent create"):
+            desc = text.strip()[13:].strip()
+            if not desc:
+                reply = "Usage: `!agent create <description>` (e.g. !agent create reminds me to drink water every hour)"
+            else:
+                ok, result = await asyncio.to_thread(_create_agent, desc)
+                reply = f"✅ {result}" if ok else f"❌ {result}"
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
@@ -5798,11 +7261,18 @@ async def on_message(message: discord.Message):
             return
         # If Luna's last message was a profile question, treat this reply as the answer
         await asyncio.to_thread(try_capture_profile_from_reply, memory_scope, _last_assistant_by_scope.get(memory_scope, ""), text)
-        # Load persisted conversation so Luna has context across restarts
-        history = await asyncio.to_thread(get_recent_conversation, memory_scope, 20)
+        # Load persisted conversation; compact old messages into a summary when long (OpenClaw-style)
+        history = await asyncio.to_thread(get_recent_conversation, memory_scope, 40)
+        history = await asyncio.to_thread(_compact_conversation_history, history)
         try:
             async with message.channel.typing():
                 reply = await asyncio.to_thread(ollama_chat, text, LUNA_SYSTEM_PROMPT, memory_scope, history)
+            # If Luna asked to record the next message to SOUL/TOOLS/OBJECTIVES, set pending and strip the marker
+            for marker, key in (("LUNA_RECORD_SOUL", "SOUL"), ("LUNA_RECORD_TOOLS", "TOOLS"), ("LUNA_RECORD_OBJECTIVES", "OBJECTIVES")):
+                if marker in reply:
+                    _pending_file_update[memory_scope] = key
+                    reply = re.sub(r"\s*" + re.escape(marker) + r"\s*", "\n", reply).strip()
+                    break
             cleaned, writes = _parse_luna_writes(reply)
             if not writes and _user_wants_file_creation(text):
                 writes = _extract_code_blocks_from_reply(reply)
@@ -5820,27 +7290,22 @@ async def on_message(message: discord.Message):
             else:
                 reply = cleaned
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            threading.Thread(target=_maybe_update_user_style, args=(memory_scope,), daemon=True).start()
             _last_assistant_by_scope[memory_scope] = reply
             await asyncio.to_thread(_try_capture_memory, memory_scope, text)
             await asyncio.to_thread(_try_capture_profile, memory_scope, text)
             if len(reply) > 1900:
                 reply = reply[:1897] + "..."
             await message.reply(f"{mention} {reply}")
-            # If Luna is in a voice channel in this guild, speak the reply with gTTS (no code read aloud).
+            # If Luna is in a voice channel in this guild, speak the reply. For configured TTS channels (e.g. Good Vibes general), auto-join voice if not in one.
             if message.guild:
                 vc = next((c for c in bot.voice_clients if c.guild == message.guild and c.is_connected()), None)
+                if not vc and message.channel.id in _discord_tts_channel_ids:
+                    vc = await _auto_join_voice_for_guild(message.guild)
+                    if vc:
+                        print(f"[Luna] Auto-joined {vc.channel.name} (TTS channel {message.channel.id})", flush=True)
                 if vc and not vc.is_playing():
-                    reply_clean = _reply_text_for_tts(reply)
-                    if reply_clean and len(reply_clean) <= 500:
-                        mp3_bytes = await _get_tts_for_discord(reply_clean)
-                        if mp3_bytes:
-                            try:
-                                source = discord.FFmpegPCMAudio(io.BytesIO(mp3_bytes), pipe=True)
-                                vc.play(source)
-                            except Exception as e:
-                                print(f"Discord voice play: {e}")
-                        elif reply_clean:
-                            print("Discord voice TTS: gTTS produced no audio.")
+                    await _ensure_voice_and_speak(message.guild, reply)
         except discord.HTTPException as e:
             print(f"Failed to reply: {e}")
         except Exception as e:
@@ -6423,7 +7888,7 @@ async def cmd_stoptts(ctx: commands.Context):
 
 @bot.command(name="call")
 async def cmd_whatsapp_call(ctx: commands.Context, *, contact: str = ""):
-    """Open WhatsApp Web and open chat with contact (calls require desktop app). Usage: !call <contact name>"""
+    """Open WhatsApp Desktop, search contact, find Call then Voice to start voice call. Usage: !call <contact name>"""
     if not _can_use_whatsapp_discord(ctx.author.id):
         await ctx.reply("Only the linked user or admin can use WhatsApp automation.")
         return
@@ -6459,7 +7924,63 @@ async def cmd_whatsapp_msg(ctx: commands.Context, *, args: str = ""):
     await ctx.reply(result if ok else f"❌ {result}")
 
 
+def _run_scheduled_x_share():
+    """Called by scheduler: post a random channel song to X."""
+    try:
+        ok, result = _run_x_share_random_song()
+        print(f"[Luna scheduler] X share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
+    except Exception as e:
+        print(f"[Luna scheduler] X share error: {e}", flush=True)
+
+
+def _run_scheduled_facebook_share():
+    """Called by scheduler: post a random channel song to Facebook."""
+    try:
+        ok, result = _run_facebook_share_random_song()
+        print(f"[Luna scheduler] Facebook share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
+    except Exception as e:
+        print(f"[Luna scheduler] Facebook share error: {e}", flush=True)
+
+
+def _run_scheduled_share_x_then_facebook():
+    """Run X share first, wait until finished, then run Facebook share (scheduler job)."""
+    try:
+        ok, result = _run_x_share_random_song()
+        print(f"[Luna scheduler] X share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
+    except Exception as e:
+        print(f"[Luna scheduler] X share error: {e}", flush=True)
+    try:
+        ok, result = _run_facebook_share_random_song()
+        print(f"[Luna scheduler] Facebook share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
+    except Exception as e:
+        print(f"[Luna scheduler] Facebook share error: {e}", flush=True)
+
+
+def _run_share_scheduler_loop():
+    """Run the schedule loop (blocking). Call in a daemon thread."""
+    if not schedule:
+        return
+    while True:
+        schedule.run_pending()
+        time.sleep(60)  # check every minute
+
+
+def _start_share_scheduler():
+    """Schedule X then Facebook shares 2 times per day. X runs first and completes before Facebook starts."""
+    if not schedule:
+        print("[Luna scheduler] 'schedule' not installed; pip install schedule for automatic X/Facebook posts.", flush=True)
+        return
+    for t in SCHEDULE_SHARE_TIMES:
+        t = t.strip()
+        if not t or ":" not in t:
+            continue
+        schedule.every().day.at(t).do(_run_scheduled_share_x_then_facebook)
+    threading.Thread(target=_run_share_scheduler_loop, daemon=True).start()
+    print(f"[Luna scheduler] X then Facebook posts at {', '.join(SCHEDULE_SHARE_TIMES)} (X first, then Facebook)", flush=True)
+
+
 def main():
+    _start_share_scheduler()
     web_thread = threading.Thread(target=run_web_ui, daemon=True)
     web_thread.start()
     threading.Thread(target=open_web_ui_in_browser, daemon=True).start()

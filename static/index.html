@@ -249,65 +249,70 @@
 
     function setStatus(msg) { statusEl.textContent = msg; }
 
-    // Microphone: start/stop recording, transcribe into message box (Web Speech API)
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    let recognition = null;
+    // Microphone: record with MediaRecorder until user clicks stop, then send to server for transcription (no browser timeout).
+    let micStream = null;
+    let mediaRecorder = null;
+    let recordedChunks = [];
     let isRecording = false;
-    let transcriptBuffer = '';
 
-    if (SpeechRecognition) {
-      recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      recognition.onresult = (e) => {
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          if (e.results[i].isFinal) transcriptBuffer += e.results[i][0].transcript;
-        }
-      };
-
-      recognition.onend = () => {
-        if (transcriptBuffer.trim()) {
-          const current = (input.value || '').trim();
-          input.value = current ? current + ' ' + transcriptBuffer.trim() : transcriptBuffer.trim();
-          setStatus('Transcript added. Edit if needed, then press Send.');
-        } else {
-          setStatus('');
-        }
-        transcriptBuffer = '';
+    micBtn.addEventListener('click', async () => {
+      if (isRecording) {
         isRecording = false;
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+        }
+        return;
+      }
+      setStatus('Requesting microphone…');
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        setStatus('Microphone access denied or unavailable.');
+        setTimeout(() => setStatus(''), 4000);
+        return;
+      }
+      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+      try {
+        mediaRecorder = new MediaRecorder(micStream);
+      } catch (err) {
+        micStream.getTracks().forEach(t => t.stop());
+        setStatus('MediaRecorder not supported.');
+        setTimeout(() => setStatus(''), 4000);
+        return;
+      }
+      recordedChunks = [];
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+      mediaRecorder.onstop = async () => {
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
         micBtn.classList.remove('recording');
-        setTimeout(() => setStatus(''), 3000);
-      };
-
-      recognition.onerror = (e) => {
-        if (e.error !== 'aborted') setStatus('Speech error: ' + (e.error || 'unknown'));
-        isRecording = false;
-        micBtn.classList.remove('recording');
-      };
-
-      micBtn.addEventListener('click', () => {
-        if (!recognition) return;
-        if (isRecording) {
-          recognition.stop();
+        if (recordedChunks.length === 0) {
+          setStatus('No recording. Click mic, speak, then click again.');
+          setTimeout(() => setStatus(''), 3000);
           return;
         }
-        transcriptBuffer = '';
+        const blob = new Blob(recordedChunks, { type: mime.split(';')[0] });
+        setStatus('Transcribing…');
         try {
-          recognition.start();
-          isRecording = true;
-          micBtn.classList.add('recording');
-          setStatus('Listening… Click mic again to stop.');
+          const res = await fetch('/api/transcribe', { method: 'POST', body: blob, headers: { 'Content-Type': blob.type || 'audio/webm' } });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.text) {
+            const current = (input.value || '').trim();
+            input.value = current ? current + ' ' + data.text : data.text;
+            setStatus('Transcript added. Edit if needed, then press Send.');
+          } else {
+            setStatus(data.error || 'Transcription failed.');
+          }
         } catch (err) {
-          setStatus('Could not start microphone.');
-          setTimeout(() => setStatus(''), 3000);
+          setStatus('Network error. Is the server running?');
         }
-      });
-    } else {
-      micBtn.disabled = true;
-      micBtn.title = 'Speech recognition not supported in this browser (try Chrome/Edge).';
-    }
+        setTimeout(() => setStatus(''), 4000);
+      };
+      mediaRecorder.start(1000);
+      isRecording = true;
+      micBtn.classList.add('recording');
+      setStatus('Listening… Click mic again when done. (Recording only stops when you click.)');
+    });
 
     stopTtsBtn.addEventListener('click', async () => {
       try {

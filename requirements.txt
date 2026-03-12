@@ -3,4 +3,7 @@ python-dotenv>=1.0.0
 flask>=3.0.0
 gtts>=2.5.0
 playwright>=1.50.0
+pywinauto>=0.6.8
 yt-dlp
+openai-whisper>=20231117
+schedule>=1.2.0

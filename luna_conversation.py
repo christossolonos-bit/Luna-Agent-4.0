@@ -44,6 +44,25 @@ def get_recent_conversation(scope: str, max_messages: int = 20) -> list[dict]:
     return [{"role": m.get("role", "user"), "content": (m.get("content") or "").strip()} for m in recent if (m.get("role") and (m.get("content") or "").strip())]
 
 
+def get_recent_user_messages(scope: str, max_messages: int = 25) -> list[str]:
+    """Return the most recent user-only messages for this scope (oldest first). Used for learning speech style."""
+    data = _load_all()
+    messages = data.get(scope)
+    if not isinstance(messages, list):
+        return []
+    user_only = [(m.get("content") or "").strip() for m in messages if (m.get("role") or "").strip().lower() == "user" and (m.get("content") or "").strip()]
+    return user_only[-max_messages:]
+
+
+def count_user_messages(scope: str) -> int:
+    """Return total number of user messages stored for this scope."""
+    data = _load_all()
+    messages = data.get(scope)
+    if not isinstance(messages, list):
+        return 0
+    return sum(1 for m in messages if (m.get("role") or "").strip().lower() == "user")
+
+
 def append_exchange(scope: str, user_message: str, assistant_reply: str) -> None:
     """Append one user message and one assistant reply to the scope's conversation. Trims store to MAX_MESSAGES_PER_SCOPE."""
     if not scope:
