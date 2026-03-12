@@ -32,10 +32,6 @@ from email.utils import parsedate_to_datetime
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-try:
-    import schedule
-except ImportError:
-    schedule = None
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 
 from luna_files import (
@@ -49,6 +45,9 @@ from luna_files import (
     read_repo_file as luna_read_repo_file,
     write_repo_file as luna_write_repo_file,
 )
+from shadow_agent import strip_shadow_prefix, run_shadow as shadow_run
+import george  # Shadow's sub-agent for scheduling X/Facebook shares
+import celine  # Sub-agent for voice clips: transcribe and decide Shadow vs Luna
 
 
 def _open_file_in_editor(relative_path: str) -> bool:
@@ -418,11 +417,7 @@ _x_bootstrap_running = False
 _fb_share_lock = threading.Lock()
 _fb_bootstrap_lock = threading.Lock()
 _fb_bootstrap_running = False
-# Scheduled X/Facebook posts: 2 times per day, Cyprus time (10:00 and 18:00). Uses system local time—set PC/server to Cyprus (EET/EEST) or override with SCHEDULE_SHARE_TIMES.
-SCHEDULE_SHARE_TIMES = (os.environ.get("SCHEDULE_SHARE_TIMES") or "10:00,18:00").strip().split(",")
-SCHEDULE_SHARE_TIMES = [t.strip() for t in SCHEDULE_SHARE_TIMES if t.strip()]
-if not SCHEDULE_SHARE_TIMES:
-    SCHEDULE_SHARE_TIMES = ["10:00", "18:00"]
+# George (Shadow's scheduler) uses GEORGE_SCHEDULE_X_TIMES and GEORGE_SCHEDULE_FACEBOOK_TIMES in george.py (default: X 10:00 & 18:00, Facebook 11:00 & 19:00).
 _yt_comment_lock = threading.Lock()
 _yt_bootstrap_lock = threading.Lock()
 _yt_bootstrap_running = False
@@ -620,6 +615,9 @@ _last_assistant_by_scope: dict[str, str] = {}
 # Discord music state (per guild) for YouTube playback queue.
 _music_states: dict[int, dict] = {}
 _music_state_lock = threading.Lock()
+# Conversational play: when search returns multiple results, wait for user to pick (guild_id -> {results, channel_id, author_id}).
+_pending_play_choice: dict[int, dict] = {}
+_pending_play_choice_lock = threading.Lock()
 _FFMPEG_BEFORE_OPTS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 _FFMPEG_OPTS = "-vn"
 # Suno only: when stream playback fails, download here and play from file. Leave empty to use temp dir for Suno too.
@@ -733,6 +731,42 @@ def _resolve_youtube_track(query: str) -> tuple[bool, dict | str]:
         }
     except Exception as e:
         return False, f"Could not resolve YouTube audio: {e}"
+
+
+def _youtube_search_multiple(query: str, max_results: int = 5) -> tuple[bool, list[dict] | str]:
+    """Search YouTube and return up to max_results as list of {title, url}. Used for conversational 'play X' -> 'Which song?' flow."""
+    q = (query or "").strip()
+    if not q:
+        return False, "No search query."
+    try:
+        import yt_dlp
+    except Exception:
+        return False, "yt-dlp is not installed."
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "default_search": f"ytsearch{max_results}",
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(q, download=False)
+        if not info or not info.get("entries"):
+            return True, []
+        results = []
+        for e in (info.get("entries") or [])[:max_results]:
+            if not isinstance(e, dict):
+                continue
+            vid_id = (e.get("id") or "").strip()
+            title = (e.get("title") or e.get("url") or "Unknown").strip()
+            url = (e.get("url") or "").strip()
+            if not url and vid_id:
+                url = f"https://www.youtube.com/watch?v={vid_id}"
+            if url:
+                results.append({"title": title, "url": url})
+        return True, results
+    except Exception as e:
+        return False, str(e)
 
 
 def _is_suno_url(query: str) -> bool:
@@ -1166,6 +1200,13 @@ def _build_system_prompt(base: str | None, memory_scope: str | None) -> str | No
     memory_block = get_memory_prompt(memory_scope)
     if memory_block:
         parts.append(memory_block)
+    style_block = get_user_style_prompt(memory_scope)
+    if style_block:
+        parts.append(style_block)
+    goals_block = get_goals_prompt(memory_scope)
+    if goals_block:
+        parts.append(goals_block)
+    parts.append("Using the user's profile and goals, you may suggest next steps or offer to help when relevant. If this seems like the start of a conversation, you may open with a brief nudge (e.g. 'You might want to…' or 'Last time you were…') when relevant.")
     identity_hint = _get_identity_file_hint()
     if identity_hint and memory_scope and (memory_scope == LINKED_SCOPE or memory_scope == "web"):
         parts.append("---\n" + identity_hint)
@@ -1175,9 +1216,18 @@ def _build_system_prompt(base: str | None, memory_scope: str | None) -> str | No
 
 
 def _try_capture_memory(scope: str, user_message: str) -> None:
-    """If user said something worth remembering, store in the right layer (core vs long-term)."""
+    """If user said something worth remembering, store in the right layer (core vs long-term). Also capture goals."""
     text = (user_message or "").strip()
     if not text or not scope:
+        return
+    # "my goal is X" / "remember my goal: X" -> goals list (Luna references in prompt)
+    m = re.search(r"\b(?:my goal is|remember my goal[:\s]+)\s*(.+?)(?:\.|$)", text, re.I | re.S)
+    if m:
+        add_goal(scope, m.group(1).strip()[:500])
+        return
+    m = re.search(r"\b(?:my goals? (?:are|is)\s+)(.+?)(?:\.|$)", text, re.I | re.S)
+    if m:
+        add_goal(scope, m.group(1).strip()[:500])
         return
     # "always remember that X" -> Layer 1 (core)
     m = re.search(r"\balways\s+remember\s+that\s+(.+?)(?:\.|$)", text, re.I | re.S)
@@ -2476,38 +2526,52 @@ def _run_suno_create(description: str) -> tuple[bool, str]:
             page.keyboard.press("Backspace")
             page.keyboard.type(desc, delay=22)
 
-            # Try multiple strategies in one session: different selectors and waits.
-            _waits = (1200, 1500, 0) if _should_prefer_longer_waits("suno") else (0, 1200, 1500)
+            # Wait for UI to enable the Create button after typing (Suno often enables it after prompt is entered).
+            page.wait_for_timeout(2000)
+
+            # Try multiple strategies: different selectors, scroll into view, force click.
+            _waits = (800, 1500, 2500) if _should_prefer_longer_waits("suno") else (800, 1500, 2500)
             clicked = False
+            button_selectors = [
+                "button:has-text('Create')",
+                "button:has-text('Generate')",
+                "button:has-text('Create song')",
+                "button:has-text('Generate song')",
+                "[role='button']:has-text('Create')",
+                "[role='button']:has-text('Generate')",
+                "[data-testid*='create']",
+                "[data-testid*='generate']",
+                "button[type='submit']",
+                "a:has-text('Create')",
+                "a:has-text('Generate')",
+            ]
             for extra_wait in _waits:
                 page.wait_for_timeout(extra_wait)
-                for bsel in (
-                    "button:has-text('Create')",
-                    "button:has-text('Generate')",
-                    "[role='button']:has-text('Create')",
-                    "[role='button']:has-text('Generate')",
-                    "button:has-text('Create')",
-                    "button:has-text('Generate')",
-                ):
-                    btn = page.locator(bsel).first
+                for bsel in button_selectors:
                     try:
-                        if btn.count() and btn.is_visible():
-                            btn.click()
-                            clicked = True
-                            break
+                        btn = page.locator(bsel).first
+                        if btn.count() > 0:
+                            btn.scroll_into_view_if_needed(timeout=3000)
+                            if btn.is_visible():
+                                btn.click(force=True, timeout=5000)
+                                clicked = True
+                                break
                     except Exception:
                         continue
                 if clicked:
                     break
                 try:
-                    page.locator("button:has-text('Create'), button:has-text('Generate')").first.click()
-                    clicked = True
-                    break
+                    combined = page.locator("button:has-text('Create'), button:has-text('Generate'), [role='button']:has-text('Create'), [role='button']:has-text('Generate')").first
+                    if combined.count() > 0:
+                        combined.scroll_into_view_if_needed(timeout=3000)
+                        combined.click(force=True, timeout=5000)
+                        clicked = True
+                        break
                 except Exception:
                     pass
 
             if not clicked:
-                return False, "I entered your prompt on Suno, but couldn't find the Create button (tried several strategies)."
+                return False, "I entered your prompt on Suno, but couldn't find or click the Create button (Suno's UI may have changed). Try clicking Create yourself in the open window."
 
             page.wait_for_timeout(2500)
             return True, f"Opened Suno, typed: \"{_suno_preview_text(desc, 260)}\", then clicked Create."
@@ -5618,14 +5682,181 @@ _pending_writes: dict[str, dict] = {}
 _pending_run: dict[str, dict] = {}
 _RUN_SCRIPT_TIMEOUT = 120  # seconds
 
+# Shadow action log (audit trail): one JSONL line per Shadow command run.
+_ACTION_LOG_PATH = os.path.join(_DATA_DIR, "action_log.jsonl")
+_action_log_lock = threading.Lock()
+
+
+def _log_shadow_action(cmd: str, params: dict, reply: str) -> None:
+    """Append one line to Shadow action log (cmd, params, reply preview). Called only when Shadow runs a command."""
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "cmd": cmd,
+            "params": {k: v for k, v in (params or {}).items() if isinstance(v, (str, int, float, bool)) or v is None},
+            "reply_preview": (reply or "")[:500],
+        }
+        with _action_log_lock:
+            with open(_ACTION_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 # Pending "record to identity file": scope -> "SOUL"|"TOOLS"|"OBJECTIVES". Next user message is saved to that file (like profile).
 _pending_file_update: dict[str, str] = {}
+
+# Pending "do" action (Shadow): scope -> {description, path, content}. User says yes -> execute file write (Luna projects or data/).
+_pending_do_action: dict[str, dict] = {}
+
+# Pending agent name: after Shadow creates an agent, scope -> { "filename": str }. Next user message = agent name; we register and clear.
+_pending_agent_name: dict[str, dict] = {}
+
+# Agents registry: name -> filename (in data/agents/). Enables "Shadow, run Hank".
+_AGENTS_REGISTRY_PATH = os.path.join(_DATA_DIR, "agents_registry.json")
+_agents_registry_lock = threading.Lock()
+
+
+def _load_agents_registry() -> dict:
+    """Load { "AgentName": "agent_20260101_xxx.py" } from disk."""
+    with _agents_registry_lock:
+        try:
+            if os.path.isfile(_AGENTS_REGISTRY_PATH):
+                with open(_AGENTS_REGISTRY_PATH, encoding="utf-8") as f:
+                    out = json.load(f)
+                return out if isinstance(out, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_agents_registry(registry: dict) -> None:
+    with _agents_registry_lock:
+        try:
+            os.makedirs(os.path.dirname(_AGENTS_REGISTRY_PATH), exist_ok=True)
+            with open(_AGENTS_REGISTRY_PATH, "w", encoding="utf-8") as f:
+                json.dump(registry, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+# User style (Luna): per-scope short summary of reply length/tone; injected into prompt. Updated in background.
+_USER_STYLE_FILE = os.path.join(_DATA_DIR, "user_style.json")
+_user_style_lock = threading.Lock()
+_USER_STYLE_UPDATE_EVERY = 5  # update style at most every N user messages (background)
+
+# Goals (Luna): per-scope list of goal strings; injected into prompt. "My goal is X" / "remember my goal: X" adds here.
+_GOALS_FILE = os.path.join(_DATA_DIR, "goals.json")
+_goals_lock = threading.Lock()
 
 # Phrases that count as "yes, create the file" (for web and Discord)
 _CONFIRM_PHRASES = frozenset({
     "yes", "y", "confirm", "confirmed", "ok", "okay", "do it", "go ahead",
     "create it", "yes please", "sure", "please do", "go", "create",
 })
+
+
+def _load_user_style_data() -> dict:
+    """Load { scope: { "summary": str } } from disk."""
+    with _user_style_lock:
+        try:
+            if os.path.isfile(_USER_STYLE_FILE):
+                with open(_USER_STYLE_FILE, encoding="utf-8") as f:
+                    out = json.load(f)
+                return out if isinstance(out, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_user_style(scope: str, summary: str) -> None:
+    with _user_style_lock:
+        data = _load_user_style_data()
+        data[scope] = {"summary": (summary or "").strip()[:500], "updated_at": datetime.now(timezone.utc).isoformat()}
+        try:
+            os.makedirs(os.path.dirname(_USER_STYLE_FILE), exist_ok=True)
+            with open(_USER_STYLE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def get_user_style_prompt(scope: str) -> str:
+    """Style block for system prompt (reply length/tone)."""
+    data = _load_user_style_data()
+    rec = data.get(scope) if scope else None
+    if not rec or not isinstance(rec, dict) or not (rec.get("summary") or "").strip():
+        return ""
+    return "User style (adapt when relevant): " + (rec.get("summary") or "").strip()
+
+
+def _maybe_update_user_style(scope: str) -> None:
+    """Background: Ollama summarizes user's style from recent messages; save. Runs in thread."""
+    if not scope:
+        return
+    history = get_recent_conversation(scope, 15)
+    user_msgs = [h.get("content", "").strip() for h in history if (h.get("role") or "").lower() == "user" and (h.get("content") or "").strip()]
+    if len(user_msgs) < 2:
+        return
+    text = "\n".join(user_msgs[-8:])
+    try:
+        out = ollama_chat(
+            f"Based on these user messages, summarize in 1-2 sentences: preferred reply length (short/medium/long), tone (casual/formal). Output only the summary.\n\n{text[:2000]}",
+            system_prompt="You are a style summarizer. One or two sentences only.",
+            memory_scope=None,
+            message_history=None,
+            model=OLLAMA_MODEL_SMALL,
+        )
+        if out and len(out.strip()) > 10:
+            _save_user_style(scope, out.strip())
+    except Exception:
+        pass
+
+
+def _load_goals(scope: str) -> list[str]:
+    with _goals_lock:
+        try:
+            if os.path.isfile(_GOALS_FILE):
+                with open(_GOALS_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get(scope), list):
+                    return [str(g).strip() for g in data[scope] if str(g).strip()]
+        except Exception:
+            pass
+    return []
+
+
+def _save_goals(scope: str, goals: list[str]) -> None:
+    with _goals_lock:
+        try:
+            data = {}
+            if os.path.isfile(_GOALS_FILE):
+                with open(_GOALS_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+            data[scope] = [g.strip() for g in goals if g.strip()][:20]
+            os.makedirs(os.path.dirname(_GOALS_FILE), exist_ok=True)
+            with open(_GOALS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def add_goal(scope: str, content: str) -> None:
+    content = (content or "").strip()[:500]
+    if not content or not scope:
+        return
+    goals = _load_goals(scope)
+    if content in goals:
+        return
+    goals = [content] + [g for g in goals if g != content][:19]
+    _save_goals(scope, goals)
+
+
+def get_goals_prompt(scope: str) -> str:
+    goals = _load_goals(scope)
+    if not goals:
+        return ""
+    return "User's current goals (reference when relevant): " + "; ".join(goals[:5])
 
 
 def _is_confirm_message(msg: str) -> bool:
@@ -5851,6 +6082,7 @@ def _extract_code_blocks_from_reply(reply: str) -> list[dict]:
 
 # Intent template for "commands" / "help" — reply without calling Ollama
 LUNA_COMMANDS_REPLY = (
+    "**Luna** = CEO (communicates with you; chat, memory, goals, style). **Shadow** = Manager (executes all commands and runs the agents under him). Say **Shadow, [what to do]** for any action (e.g. Shadow, share a song on X; Shadow, message Marios; Shadow, do …; Shadow, create an agent that… — then you'll be asked for a name, e.g. Hank; Shadow, run Hank to run it; Shadow, explain last error). You can also ask Luna for an action — she delegates to Shadow.\n\n"
     "**Luna file access** (only inside Luna projects):\n"
     "• !read <path> — read file\n"
     "• !write <path> <content> — write file\n"
@@ -5868,7 +6100,7 @@ LUNA_COMMANDS_REPLY = (
     "• !fb_msg <username or name> [message] — send a Facebook Messenger message\n"
     "• !remember / !always_remember — store memories\n"
     "• !profile — view or set your profile\n"
-    "• !join / !leave — voice; !play / !pause / !skip / !stop / !queue — music (YouTube or Suno URL)\n"
+    "• !join / !leave — voice; !play or say **play** <artist/song> (e.g. play AC/DC); if multiple: **Which song?** — reply with number or name; !pause / !skip / !stop / !queue — music\n"
     "• !call <contact> — WhatsApp Desktop: open app, find Call then Voice to start voice call (Windows)\n"
     "• !msg <contact> [description] — WhatsApp Web: open chat and send message (default or your text, from Luna)\n"
     "• !optimize — Luna analyzes and optimizes her own code (repo only; you push to GitHub)\n"
@@ -5898,6 +6130,10 @@ Commands and their JSON shape (use these keys only):
 - Optimize yourself / analyze and optimize your code / self-optimize: {"command": "optimize"}
 - Add, change, or implement something in Luna's project/code (any natural-language request to change her code, add a feature, fix behavior, or "make it so that..."): {"command": "create_feature", "description": "<full user request in their words>"}
 - Show commands / help / what can you do: {"command": "files"}
+- Explain why the last action failed (e.g. why did that fail, explain last error): {"command": "explain_error"}
+- Research how to do something, then do it after user confirms (e.g. do X, research how to X): {"command": "do", "description": "<what to do>"}
+- Create a small agent/script that does something (e.g. create an agent that X): {"command": "agent_create", "description": "<what the agent should do>"}
+- Run a registered agent by name (e.g. run Hank, run George): {"command": "run_agent", "name": "<agent name>"}
 - Join voice channel: {"command": "join"}
 - Leave voice: {"command": "leave"}
 - Pause / resume / skip / stop music, show queue: {"command": "pause"}, {"command": "resume"}, {"command": "skip"}, {"command": "stop"}, {"command": "queue"}
@@ -5910,7 +6146,7 @@ _NL_COMMAND_STARTS = (
     "remind ", "share ", "post ", "run ", "google ", "news ", "suno ", "comment ",
     "whatsapp ", "facebook ", "instagram ", "youtube ", "optimize ", "add ",
     "make ", "change ", "update ", "implement ", "build ", "fix ", "improve ",
-    "i want ", "i'd like ", "can you ", "could you ",
+    "i want ", "i'd like ", "can you ", "could you ", "do ", "research ", "why ", "explain ",
 )
 _NL_COMMAND_START_EXACT = ("play", "search", "send", "create", "open", "call", "msg", "run", "google", "news", "optimize")
 
@@ -5934,6 +6170,35 @@ def _message_likely_command(msg: str) -> bool:
 def employee_commander(msg: str) -> tuple[str, dict] | None:
     """Employee: Commander. Parses natural language into (command_key, params). Uses OLLAMA_MODEL_SMALL. Used by Boss when message looks like a command."""
     return _parse_natural_language_command(msg)
+
+
+def _shadow_parse_with_fallback(msg: str) -> tuple[str, dict] | None:
+    """Try Suno/create-a-song heuristics first so 'Shadow, suno create...', 'Shadow, create a song about...' and 'Shadow, Suno, ...' work; else Commander."""
+    m = (msg or "").strip()
+    if not m:
+        return None
+    low = m.lower()
+    # "suno create ..." or "suno create a song about ..." -> description is everything after "suno create"
+    if low.startswith("suno create"):
+        desc = m[11:].lstrip(" ,\t")
+        if desc:
+            return ("suno", {"description": desc})
+    # "Suno, a woman that is flying..." or "suno a woman..."
+    if low.startswith("suno"):
+        desc = m[4:].lstrip(" ,\t")
+        if desc:
+            return ("suno", {"description": desc})
+    # "create a song about a woman that is flying..."
+    if low.startswith("create a song about"):
+        desc = m[18:].strip()
+        if desc:
+            return ("suno", {"description": desc})
+    # "create a song ..." or "create a song on suno ..."
+    if low.startswith("create a song"):
+        desc = m[14:].strip()
+        if desc:
+            return ("suno", {"description": desc})
+    return employee_commander(msg)
 
 
 def employee_scribe(messages: list[dict]) -> str:
@@ -6075,6 +6340,159 @@ def _run_create_feature(scope: str | None, description: str) -> str:
     return f"✅ Feature added. Updated/created: {', '.join(applied)}.\n\nRestart Luna to load changes. You can push to GitHub when ready."
 
 
+def _run_do_research_and_propose(scope: str | None, description: str) -> str:
+    """Shadow: research how to do X, propose one file write (Luna projects or data/), store in _pending_do_action. User says yes to execute."""
+    if not (description or "").strip():
+        return "What should I do? Say e.g. Shadow, do remind me to drink water at 10am, or Shadow, do add a note about X."
+    desc = description.strip()[:2000]
+    try:
+        step1 = ollama_chat(
+            f"The user wants to: {desc}\n\nIn 2-3 sentences, how would you do it? (e.g. create a reminder file, add a note in Luna projects, or a small data file.) Be concrete.",
+            system_prompt="You are a practical assistant. Suggest one concrete file-based action.",
+            memory_scope=None,
+            message_history=None,
+            model=OLLAMA_MODEL_SMALL,
+        )
+        step2 = ollama_chat(
+            f"Approach: {step1}\n\nOutput exactly ONE file to create. Path must be relative to 'Luna projects' (e.g. reminders.txt, notes/foo.txt) or 'data/' (e.g. data/reminders.txt).\nFormat, exactly:\nPATH: <path>\nCONTENT:\n<full content>\nEND",
+            system_prompt="Output only PATH: and CONTENT: as specified. Path under Luna projects or data/ only.",
+            memory_scope=None,
+            message_history=None,
+            model=OLLAMA_MODEL_SMALL,
+        )
+        path = ""
+        content = ""
+        if "PATH:" in step2 and "CONTENT:" in step2:
+            a, b = step2.split("CONTENT:", 1)
+            path = (a.split("PATH:")[-1].strip().split("\n")[0].strip()).strip()
+            content = b.split("END")[0].strip() if "END" in b else b.strip()
+        path = path.replace("\\", "/").strip()
+        if path.lower().startswith("luna projects/"):
+            path = path[14:].lstrip("/")
+        if not path:
+            path = f"note_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+        if not path.startswith("data/") and luna_safe_path(path) is None:
+            path = f"note_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+        if not scope:
+            return "Say that in chat so I can confirm before running."
+        _pending_do_action[scope] = {"description": desc, "path": path.replace("\\", "/").lstrip("/"), "content": content or "(no content)"}
+        return f"**Research:** {step1[:400]}\n\nI'll create/overwrite: **{path}**\n\nReply **yes** to run it, or **no** to cancel."
+    except Exception as e:
+        return f"Research failed: {e}"
+
+
+def _execute_pending_do_action(scope: str) -> str:
+    """Run the pending 'do' action: write file to Luna projects or data/. Clears _pending_do_action[scope]."""
+    pending = _pending_do_action.pop(scope, None)
+    if not pending or not pending.get("path"):
+        return "Nothing to run."
+    path = (pending.get("path") or "").strip().replace("\\", "/").lstrip("/")
+    content = pending.get("content") or ""
+    if path.startswith("data/"):
+        full = os.path.join(_DATA_DIR, path[5:].lstrip("/"))
+        try:
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"✅ Wrote to {path}"
+        except Exception as e:
+            return f"❌ {e}"
+    safe = luna_safe_path(path)
+    if safe is None:
+        return "❌ Path not allowed (only Luna projects or data/)."
+    ok, result = luna_write_file(path, content)
+    return f"✅ {result}" if ok else f"❌ {result}"
+
+
+def _run_agent_create(scope: str | None, description: str) -> str:
+    """Shadow: create a small Python agent from description. Saves to data/agents/ and Luna projects/agents/; then asks for a name and registers it."""
+    if not (description or "").strip():
+        return "What should the agent do? Say e.g. Shadow, create an agent that fetches the weather."
+    desc = description.strip()[:1500]
+    agents_dir = os.path.join(_DATA_DIR, "agents")
+    luna_agents_dir = os.path.join(LUNA_PROJECTS_BASE, "agents") if isinstance(LUNA_PROJECTS_BASE, str) else str(LUNA_PROJECTS_BASE / "agents")
+    os.makedirs(agents_dir, exist_ok=True)
+    os.makedirs(luna_agents_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = re.sub(r"[^\w\-]", "_", desc[:40].strip()) or "agent"
+    filename = f"agent_{ts}_{safe_name}.py"
+    try:
+        prompt = f"""Create a single Python script that: {desc}
+
+Requirements:
+- One .py file, runnable with: python script.py
+- Use only standard library or common deps (requests, etc.). No Luna/bot imports.
+- Include a short docstring and if needed argparse for CLI.
+Output only the Python code, no markdown."""
+        code = ollama_chat(prompt, system_prompt="You are a Python developer. Output only valid Python code.", memory_scope=None, message_history=None, model=OLLAMA_MODEL)
+        code = code.strip()
+        if code.startswith("```"):
+            code = re.sub(r"^```\w*\n?", "", code)
+            code = re.sub(r"\n?```\s*$", "", code)
+        out_path_data = os.path.join(agents_dir, filename)
+        out_path_luna = os.path.join(luna_agents_dir, filename)
+        with open(out_path_data, "w", encoding="utf-8") as f:
+            f.write(code)
+        with open(out_path_luna, "w", encoding="utf-8") as f:
+            f.write(code)
+        if scope:
+            _pending_agent_name[scope] = {"filename": filename}
+            return f"✅ Agent created: **{filename}**. What name do you want for this agent? (You'll use it to run it later, e.g. **Shadow, run Hank**.) Reply with the name only, or **no** to skip naming."
+        return f"✅ Agent created: **{filename}** (in data/agents/ and Luna projects/agents/). Say that in chat and I'll ask for a name so you can run it with Shadow, run <name>."
+    except Exception as e:
+        return f"❌ Agent creation failed: {e}"
+
+
+def _register_agent_name(scope: str, name: str) -> str:
+    """If scope has a pending agent, register it under the given name. Returns reply message. Clears _pending_agent_name[scope]."""
+    pending = _pending_agent_name.pop(scope, None)
+    if not pending or not pending.get("filename"):
+        return ""
+    filename = pending["filename"]
+    # Sanitize name: alphanumeric, spaces, hyphen -> one word or words joined by underscore (e.g. Hank, George, Weather_Bot)
+    clean = re.sub(r"[^\w\s\-]", "", (name or "").strip()).strip() or "agent"
+    clean = clean.replace(" ", "_").replace("-", "_")[:64].strip("_") or "agent"
+    if len(clean) < 1 or len(clean) > 64:
+        _pending_agent_name[scope] = pending  # put back
+        return "Name must be 1–64 characters. Try again (e.g. Hank, George, Weather_Bot)."
+    registry = _load_agents_registry()
+    registry[clean] = filename
+    _save_agents_registry(registry)
+    return f"✅ Agent registered as **{clean}**. Say **Shadow, run {clean}** to run it."
+
+
+def _run_agent_by_name(name: str) -> str:
+    """Run a registered agent by name. Returns output or error string."""
+    name = (name or "").strip()
+    if not name:
+        return "Which agent? Say e.g. Shadow, run Hank."
+    registry = _load_agents_registry()
+    filename = registry.get(name)
+    if not filename:
+        names = ", ".join(sorted(registry.keys())[:10]) or "none"
+        return f"Unknown agent **{name}**. Registered agents: {names}."
+    agents_dir = os.path.join(_DATA_DIR, "agents")
+    path = os.path.join(agents_dir, filename)
+    if not os.path.isfile(path):
+        return f"Agent file missing: {filename}."
+    try:
+        result = subprocess.run(
+            [sys.executable, path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=agents_dir,
+        )
+        out = (result.stdout or "").strip() or (result.stderr or "").strip()
+        if result.returncode != 0 and out:
+            return f"**{name}** (exit {result.returncode}):\n{out[:1500]}"
+        return f"**{name}**:\n{out[:2000]}" if out else f"✅ **{name}** ran (no output)."
+    except subprocess.TimeoutExpired:
+        return f"❌ **{name}** timed out after 60s."
+    except Exception as e:
+        return f"❌ **{name}**: {e}"
+
+
 def _run_parsed_command(cmd: str, params: dict, scope: str | None = None) -> str:
     """Execute a parsed command (from NL or internal) and return the reply text. scope needed for 'do' (pending action)."""
     cmd = (cmd or "").strip().lower()
@@ -6084,6 +6502,16 @@ def _run_parsed_command(cmd: str, params: dict, scope: str | None = None) -> str
     if cmd == "create_feature":
         desc = (p.get("description") or p.get("query") or "").strip()
         return _run_create_feature(scope, desc)
+    if cmd == "explain_error":
+        return _handle_why_mistake_llm()
+    if cmd == "do":
+        return _run_do_research_and_propose(scope, (p.get("description") or p.get("query") or "").strip())
+    if cmd == "agent_create":
+        desc = (p.get("description") or p.get("query") or "").strip()
+        return _run_agent_create(scope, desc)
+    if cmd == "run_agent":
+        name = (p.get("name") or p.get("agent") or "").strip()
+        return _run_agent_by_name(name)
     if cmd == "msg":
         contact = (p.get("contact") or "").strip()
         desc = (p.get("description") or "").strip() or None
@@ -6322,11 +6750,24 @@ def _is_retry_solution_request(msg: str) -> bool:
 
 
 def _handle_why_mistake() -> str:
-    """Return the last automation error (no LLM explanation)."""
+    """Return the last automation error (no LLM explanation). Used when Luna path asks."""
     if not _last_automation_error:
         return "I don't have a recent mistake to explain. If something failed, try the action again and then ask me why it failed."
     cmd = _last_automation_command or "that action"
     return f"**Last action:** {cmd}\n\n**What went wrong:** {_last_automation_error}"
+
+
+def _handle_why_mistake_llm() -> str:
+    """Shadow: use Ollama to explain why the last automation failed. One short paragraph."""
+    if not _last_automation_error:
+        return "No recent failure to explain. Run an action first; if it fails, say **Shadow, explain last error**."
+    cmd = _last_automation_command or "the action"
+    prompt = f"The user ran a command that failed.\n\nCommand: {cmd}\nRaw error: {_last_automation_error}\n\nIn 2–4 sentences, explain in plain language why it likely failed and what to try (e.g. check login, retry, different input). No code. Reply only with the explanation."
+    try:
+        out = ollama_chat(prompt, system_prompt="You are a concise technical assistant. Explain errors clearly.", memory_scope=None, message_history=None, model=OLLAMA_MODEL_SMALL)
+        return f"**Last action:** {cmd}\n\n**What went wrong:** {_last_automation_error}\n\n**Explanation:** {out.strip()}"
+    except Exception as e:
+        return f"**Last action:** {cmd}\n\n**What went wrong:** {_last_automation_error}\n\n(Could not generate explanation: {e})"
 
 
 def _handle_retry_solution() -> str:
@@ -6355,8 +6796,10 @@ def _is_nl_command_allowed_on_discord(cmd: str, author_id: int) -> bool:
         return _can_use_instagram_dm_discord(author_id)
     if cmd == "fb_msg":
         return _can_use_messenger_discord(author_id)
-    if cmd in ("read", "list", "write", "edit", "run", "optimize", "create_feature"):
+    if cmd in ("read", "list", "write", "edit", "run", "optimize", "create_feature", "do", "agent_create", "run_agent"):
         return _discord_admin_id_int is not None and author_id == _discord_admin_id_int
+    if cmd == "explain_error":
+        return True  # anyone can ask Shadow to explain last error
     return True
 
 
@@ -6592,6 +7035,22 @@ def api_chat():
         append_exchange(scope, msg, reply)
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
+    if _is_confirm_message(msg) and scope and scope in _pending_do_action:
+        reply = _execute_pending_do_action(scope)
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
+    # Pending agent name: user just created an agent; this message is the name (or no/cancel)
+    if scope and scope in _pending_agent_name:
+        msg_lower = (msg or "").strip().lower()
+        if msg_lower in ("no", "cancel"):
+            _pending_agent_name.pop(scope, None)
+            reply = "Cancelled. Agent is saved but not registered; you can run it by filename from data/agents/."
+        else:
+            reply = _register_agent_name(scope, msg)
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
     pending_scope = scope if scope in _pending_writes else _pending_write_scope_for_web()
     if _is_confirm_message(msg) and pending_scope is not None:
         pending = _pending_writes.pop(pending_scope)
@@ -6620,6 +7079,13 @@ def api_chat():
         append_exchange(pending_scope, msg, reply)
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
+    # Shadow: "Shadow, do X" -> run command only, no Luna LLM (lighter + faster)
+    rest = strip_shadow_prefix(msg)
+    if rest is not None:
+        reply = shadow_run(rest, scope, _shadow_parse_with_fallback, _run_parsed_command, log_fn=_log_shadow_action)
+        append_exchange(scope, msg, reply)
+        _play_reply_tts_on_pc(reply)
+        return jsonify({"reply": reply})
     msg_lower = (msg or "").strip().lower()
     if msg_lower.startswith("!run"):
         path = msg.strip()[4:].strip().replace("\\", "/").lstrip("/")
@@ -6637,6 +7103,16 @@ def api_chat():
         if scope and scope in _pending_run:
             _pending_run.pop(scope, None)
             reply = "Cancelled."
+            append_exchange(scope, msg, reply)
+            return jsonify({"reply": reply})
+        if scope and scope in _pending_do_action:
+            _pending_do_action.pop(scope, None)
+            reply = "Cancelled."
+            append_exchange(scope, msg, reply)
+            return jsonify({"reply": reply})
+        if scope and scope in _pending_agent_name:
+            _pending_agent_name.pop(scope, None)
+            reply = "Cancelled. Agent is saved but not registered; you can run it by filename from data/agents/."
             append_exchange(scope, msg, reply)
             return jsonify({"reply": reply})
         if scope in _pending_writes or _pending_write_scope_for_web() is not None:
@@ -6662,13 +7138,14 @@ def api_chat():
         append_exchange(scope, msg, reply)
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
-    # Boss: if message looks like a command, ask Commander to parse it.
+    # Boss: if message looks like a command, Commander parses it and Shadow executes (all commands done by Shadow).
     if not msg.strip().startswith("!") and _message_likely_command(msg):
         parsed = employee_commander(msg)
         if parsed:
             cmd_key, cmd_params = parsed
             reply = _run_parsed_command(cmd_key, cmd_params, scope)
             if reply:
+                _log_shadow_action(cmd_key, cmd_params, reply)
                 append_exchange(scope, msg, reply)
                 _play_reply_tts_on_pc(reply)
                 return jsonify({"reply": reply})
@@ -6789,6 +7266,7 @@ def api_chat():
             append_exchange(scope, msg, final_display)
             _try_capture_memory(scope, msg)
             _try_capture_profile(scope, msg)
+            threading.Thread(target=_maybe_update_user_style, args=(scope,), daemon=True).start()
             _play_reply_tts_on_pc(final_display)
             yield f"data: {json.dumps({'done': True, 'final': final_display}, ensure_ascii=False)}\n\n"
         return Response(
@@ -6807,6 +7285,7 @@ def api_chat():
     append_exchange(scope, msg, reply)
     _try_capture_memory(scope, msg)
     _try_capture_profile(scope, msg)
+    threading.Thread(target=_maybe_update_user_style, args=(scope,), daemon=True).start()
     _play_reply_tts_on_pc(reply)
     return jsonify({"reply": reply})
 
@@ -6979,14 +7458,172 @@ async def on_ready():
     )
 
 
+def _parse_play_choice(user_message: str, results: list[dict]) -> int | None:
+    """Parse user reply to 'Which song?' — number 1..n or partial title match. Returns 0-based index or None."""
+    msg = (user_message or "").strip().lower()
+    if not msg or not results:
+        return None
+    # Number: "1", "2", "3" or "the first one", "second", "2nd"
+    if msg.isdigit():
+        i = int(msg)
+        if 1 <= i <= len(results):
+            return i - 1
+        return None
+    for word in ("first", "second", "third", "fourth", "fifth"):
+        if word in msg:
+            idx = ("first", "second", "third", "fourth", "fifth").index(word)
+            if idx < len(results):
+                return idx
+            return None
+    # Partial title match
+    for i, r in enumerate(results):
+        title = (r.get("title") or "").lower()
+        if msg in title or title in msg:
+            return i
+    return None
+
+
+def _celine_route_decider(text: str) -> str | None:
+    """Used by Celine: return 'shadow' if transcript is a command, 'luna' if chat."""
+    if not (text or "").strip():
+        return None
+    if strip_shadow_prefix(text) is not None:
+        return "shadow"
+    if _message_likely_command(text) and employee_commander(text) is not None:
+        return "shadow"
+    return "luna"
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # ——— Celine: voice clip / MP3 from phone — transcribe and decide Shadow (command) vs Luna (chat)
+    effective_content = (message.content or "").strip()
+    celine_route: str | None = None
+    voice_text, celine_route = await celine.process_voice_message(
+        message,
+        transcribe_fn=_transcribe_audio_with_whisper,
+        route_decider=_celine_route_decider,
+        run_in_thread=asyncio.to_thread,
+    )
+    if voice_text:
+        effective_content = voice_text
+        if celine_route:
+            print(f"[Celine] Voice → {celine_route}: {effective_content[:80]}…", flush=True)
+
+    # ——— Conversational music: "Which song?" follow-up (user picked from list)
+    if message.guild:
+        with _pending_play_choice_lock:
+            pending = _pending_play_choice.get(message.guild.id)
+        if pending and message.channel.id == pending.get("channel_id") and message.author.id == pending.get("author_id"):
+            results = pending.get("results") or []
+            idx = _parse_play_choice(effective_content, results)
+            if idx is not None:
+                with _pending_play_choice_lock:
+                    _pending_play_choice.pop(message.guild.id, None)
+                url = (results[idx].get("url") or "").strip()
+                if not url:
+                    await message.reply("❌ Could not get that song's URL.")
+                    return
+                ok, track_result = await asyncio.to_thread(_resolve_play_track, url)
+                if not ok:
+                    await message.reply(f"❌ {track_result}")
+                    return
+                track = track_result
+                track["request_channel_id"] = message.channel.id
+                if not message.author.voice or not message.author.voice.channel:
+                    await message.reply("You're not in a voice channel anymore.")
+                    return
+                target_channel = message.author.voice.channel
+                vc = message.guild.voice_client
+                try:
+                    if vc and vc.is_connected():
+                        if vc.channel.id != target_channel.id:
+                            await vc.move_to(target_channel)
+                    else:
+                        vc = await target_channel.connect()
+                except Exception as e:
+                    await message.reply(f"Couldn't join voice channel: {e}")
+                    return
+                state = _music_state_for_guild(message.guild.id)
+                state["queue"].append(track)
+                started = await asyncio.to_thread(_start_next_music_track, message.guild.id, vc)
+                title = (track.get("title") or "Unknown").strip()
+                if started:
+                    await message.reply(f"▶️ Playing: **{title}**")
+                else:
+                    await message.reply(f"➕ Queued: **{title}**")
+                return
+            # Not a valid choice — leave pending so they can try again or say "cancel"
+            if effective_content.lower() in ("cancel", "nevermind", "never mind"):
+                with _pending_play_choice_lock:
+                    _pending_play_choice.pop(message.guild.id, None)
+                await message.reply("Cancelled. Say `play <something>` to search again.")
+                return
+
+    # ——— Conversational music: "play AC/DC" (no !play) — search YouTube, then "Which song?" if multiple
+    if message.guild and message.author.voice and message.author.voice.channel:
+        raw = effective_content
+        low = raw.lower()
+        if low.startswith("play ") and len(raw) > 5:
+            query = raw[5:].strip()
+            if query and not raw.startswith("!"):
+                ok, search_result = await asyncio.to_thread(_youtube_search_multiple, query, 5)
+                if not ok:
+                    await message.reply(f"❌ Search failed: {search_result}")
+                    return
+                results = search_result if isinstance(search_result, list) else []
+                if not results:
+                    await message.reply(f"No YouTube results for **{query}**. Try different words or use `!play <url>`.")
+                    return
+                if len(results) == 1:
+                    url = (results[0].get("url") or "").strip()
+                    if url:
+                        ok, track_result = await asyncio.to_thread(_resolve_play_track, url)
+                        if not ok:
+                            await message.reply(f"❌ {track_result}")
+                            return
+                        track = track_result
+                        track["request_channel_id"] = message.channel.id
+                        target_channel = message.author.voice.channel
+                        vc = message.guild.voice_client
+                        try:
+                            if vc and vc.is_connected():
+                                if vc.channel.id != target_channel.id:
+                                    await vc.move_to(target_channel)
+                            else:
+                                vc = await target_channel.connect()
+                        except Exception as e:
+                            await message.reply(f"Couldn't join voice channel: {e}")
+                            return
+                        state = _music_state_for_guild(message.guild.id)
+                        state["queue"].append(track)
+                        started = await asyncio.to_thread(_start_next_music_track, message.guild.id, vc)
+                        title = (track.get("title") or "Unknown").strip()
+                        if started:
+                            await message.reply(f"▶️ Playing: **{title}**")
+                        else:
+                            await message.reply(f"➕ Queued: **{title}**")
+                        return
+                # Multiple results: ask which song
+                with _pending_play_choice_lock:
+                    _pending_play_choice[message.guild.id] = {
+                        "results": results,
+                        "channel_id": message.channel.id,
+                        "author_id": message.author.id,
+                    }
+                lines = [f"**Which song?** (reply with a number or the song name)"]
+                for i, r in enumerate(results[:5], 1):
+                    title = (r.get("title") or "Unknown")[:80]
+                    lines.append(f"{i}. {title}")
+                await message.reply("\n".join(lines))
+                return
+
     # Reply when mentioned or in DM — use Ollama (same memory, profile, conversation as web; unique per Discord user)
     if isinstance(message.channel, discord.DMChannel) or is_mentioning_luna(message):
-        text = (message.content or "").strip()
+        text = effective_content
         # Remove bot mention from text for the prompt
         if bot.user and f"<@{bot.user.id}>" in text:
             text = text.replace(f"<@{bot.user.id}>", "").strip()
@@ -7024,6 +7661,21 @@ async def on_message(message: discord.Message):
                 reply = f"✅ **Output:**\n```\n{output[:1900]}{'…' if len(output) > 1900 else ''}\n```" if ok else f"❌ {output}"
             else:
                 reply = "Nothing to run."
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        if is_confirm and memory_scope in _pending_do_action:
+            reply = await asyncio.to_thread(_execute_pending_do_action, memory_scope)
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        if memory_scope in _pending_agent_name:
+            text_lower = (text or "").strip().lower()
+            if text_lower in ("no", "cancel"):
+                _pending_agent_name.pop(memory_scope, None)
+                reply = "Cancelled. Agent is saved but not registered; you can run it by filename from data/agents/."
+            else:
+                reply = await asyncio.to_thread(_register_agent_name, memory_scope, text)
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
@@ -7066,6 +7718,18 @@ async def on_message(message: discord.Message):
                 await asyncio.to_thread(append_exchange, memory_scope, text, reply)
                 await message.reply(f"{mention} {reply}")
                 return
+            if memory_scope in _pending_do_action:
+                _pending_do_action.pop(memory_scope, None)
+                reply = "Cancelled."
+                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                await message.reply(f"{mention} {reply}")
+                return
+            if memory_scope in _pending_agent_name:
+                _pending_agent_name.pop(memory_scope, None)
+                reply = "Cancelled. Agent is saved but not registered."
+                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                await message.reply(f"{mention} {reply}")
+                return
             if memory_scope in _pending_writes:
                 _pending_writes.pop(memory_scope, None)
                 reply = "Cancelled."
@@ -7089,7 +7753,41 @@ async def on_message(message: discord.Message):
             await asyncio.to_thread(append_exchange, memory_scope, text, LUNA_COMMANDS_REPLY)
             await message.reply(f"{mention} {LUNA_COMMANDS_REPLY}")
             return
-        # Boss: if message looks like a command, ask Commander to parse it.
+        # Shadow: run when typed "Shadow, …" or when Celine (voice) decided it's a command (skip when Celine said luna)
+        if celine_route == "luna":
+            pass  # Celine said chat → skip Shadow, continue to Luna
+        elif celine_route == "shadow":
+            # Voice command: run Shadow with full transcript (e.g. "share on X")
+            reply = await asyncio.to_thread(
+                shadow_run,
+                text,
+                memory_scope,
+                _shadow_parse_with_fallback,
+                _run_parsed_command,
+                permission_fn=_is_nl_command_allowed_on_discord,
+                author_id=message.author.id,
+                log_fn=_log_shadow_action,
+            )
+            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+            await message.reply(f"{mention} {reply}")
+            return
+        else:
+            rest = strip_shadow_prefix(text)
+            if rest is not None:
+                reply = await asyncio.to_thread(
+                    shadow_run,
+                    rest,
+                    memory_scope,
+                    _shadow_parse_with_fallback,
+                    _run_parsed_command,
+                    permission_fn=_is_nl_command_allowed_on_discord,
+                    author_id=message.author.id,
+                    log_fn=_log_shadow_action,
+                )
+                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+                await message.reply(f"{mention} {reply}")
+                return
+        # Boss: if message looks like a command, Commander parses it and Shadow executes (all commands done by Shadow).
         if not text.strip().startswith("!") and _message_likely_command(text):
             parsed = await asyncio.to_thread(employee_commander, text)
             if parsed:
@@ -7097,6 +7795,7 @@ async def on_message(message: discord.Message):
                 if _is_nl_command_allowed_on_discord(cmd_key, message.author.id):
                     reply = await asyncio.to_thread(_run_parsed_command, cmd_key, cmd_params, memory_scope)
                     if reply:
+                        await asyncio.to_thread(_log_shadow_action, cmd_key, cmd_params, reply)
                         await asyncio.to_thread(append_exchange, memory_scope, text, reply)
                         await message.reply(f"{mention} {reply}")
                         return
@@ -7891,44 +8590,21 @@ async def cmd_whatsapp_msg(ctx: commands.Context, *, args: str = ""):
 
 
 def _run_scheduled_x_share():
-    """Called by scheduler: post a random channel song to X."""
+    """Called by George (Shadow's scheduler): post a random channel song to X."""
     try:
         ok, result = _run_x_share_random_song()
-        print(f"[Luna scheduler] X share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
+        print(f"[George] X share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
     except Exception as e:
-        print(f"[Luna scheduler] X share error: {e}", flush=True)
+        print(f"[George] X share error: {e}", flush=True)
 
 
 def _run_scheduled_facebook_share():
-    """Called by scheduler: post a random channel song to Facebook."""
+    """Called by George (Shadow's scheduler): post a random channel song to Facebook."""
     try:
         ok, result = _run_facebook_share_random_song()
-        print(f"[Luna scheduler] Facebook share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
+        print(f"[George] Facebook share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
     except Exception as e:
-        print(f"[Luna scheduler] Facebook share error: {e}", flush=True)
-
-
-def _run_scheduled_share_x_then_facebook():
-    """Run X share first, wait until finished, then run Facebook share (scheduler job)."""
-    try:
-        ok, result = _run_x_share_random_song()
-        print(f"[Luna scheduler] X share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
-    except Exception as e:
-        print(f"[Luna scheduler] X share error: {e}", flush=True)
-    try:
-        ok, result = _run_facebook_share_random_song()
-        print(f"[Luna scheduler] Facebook share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
-    except Exception as e:
-        print(f"[Luna scheduler] Facebook share error: {e}", flush=True)
-
-
-def _run_share_scheduler_loop():
-    """Run the schedule loop (blocking). Call in a daemon thread."""
-    if not schedule:
-        return
-    while True:
-        schedule.run_pending()
-        time.sleep(60)  # check every minute
+        print(f"[George] Facebook share error: {e}", flush=True)
 
 
 def _warmup_ollama():
@@ -7954,17 +8630,8 @@ def _warmup_ollama():
 
 
 def _start_share_scheduler():
-    """Schedule X then Facebook shares 2 times per day. X runs first and completes before Facebook starts."""
-    if not schedule:
-        print("[Luna scheduler] 'schedule' not installed; pip install schedule for automatic X/Facebook posts.", flush=True)
-        return
-    for t in SCHEDULE_SHARE_TIMES:
-        t = t.strip()
-        if not t or ":" not in t:
-            continue
-        schedule.every().day.at(t).do(_run_scheduled_share_x_then_facebook)
-    threading.Thread(target=_run_share_scheduler_loop, daemon=True).start()
-    print(f"[Luna scheduler] X then Facebook posts at {', '.join(SCHEDULE_SHARE_TIMES)} (X first, then Facebook)", flush=True)
+    """Start George (Shadow's sub-agent): scheduled X and Facebook shares at separate times (10:00 & 18:00 X, 11:00 & 19:00 Facebook)."""
+    george.start_george(_run_scheduled_x_share, _run_scheduled_facebook_share)
 
 
 def main():

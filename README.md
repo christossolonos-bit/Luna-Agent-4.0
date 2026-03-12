@@ -23,7 +23,7 @@ Luna is a personal AI companion and automation assistant: Discord bot, web chat 
 
 ### Automation (browser)
 - **Suno** — Song creation via description; first login in browser, then automated.
-- **X (Twitter) & Facebook** — Share a random song from a configured YouTube channel; scheduled twice daily (e.g. 10:00 and 18:00) with X first, then Facebook.
+- **X (Twitter) & Facebook** — Share a random song from a configured YouTube channel; **George** (Shadow's sub-agent) schedules X at 10:00 & 18:00 and Facebook at 11:00 & 19:00 (local time).
 - **YouTube** — Comment on videos/Shorts (transcribe or use title/description, then post).
 - **Instagram** — DM by username or direct thread URL.
 - **WhatsApp** — Desktop call flow (e.g. `!call <contact>`) and Web messaging (`!msg <contact> [context]`).
@@ -53,7 +53,7 @@ Luna is a personal AI companion and automation assistant: Discord bot, web chat 
    python -m playwright install chromium
    ```
    FFmpeg in PATH is needed for TTS and music playback.
-4. **Config** — Copy `.env.example` to `.env` and set at least `DISCORD_TOKEN`. Optionally set `OLLAMA_MODEL`, `SCHEDULE_SHARE_TIMES` (e.g. `10:00,18:00`), and other variables (see `.env.example`).
+4. **Config** — Copy `.env.example` to `.env` and set at least `DISCORD_TOKEN`. Optionally set `OLLAMA_MODEL`, `GEORGE_SCHEDULE_X_TIMES` / `GEORGE_SCHEDULE_FACEBOOK_TIMES`, and other variables (see `.env.example`).
 5. **Run**:
    ```bash
    python bot.py
@@ -72,7 +72,7 @@ Luna is a personal AI companion and automation assistant: Discord bot, web chat 
 
 - **Discord** — `DISCORD_TOKEN`, optional `DISCORD_ADMIN_ID`, `LINKED_DISCORD_USER_ID`, `DISCORD_TTS_CHANNEL_IDS` (auto-join voice in those text channels).
 - **Ollama** — `OLLAMA_BASE_URL`, `OLLAMA_MODEL` (default `qwen2.5-coder:7b-instruct`).
-- **Scheduler** — `SCHEDULE_SHARE_TIMES` (e.g. `10:00,18:00` for X and Facebook posts; uses system local time).
+- **George (scheduler)** — `george.py` runs share-to-X and share-to-Facebook at set times (default X 10:00 & 18:00, Facebook 11:00 & 19:00); override with `GEORGE_SCHEDULE_X_TIMES` and `GEORGE_SCHEDULE_FACEBOOK_TIMES`.
 - **Identity** — Edit `data/SOUL.md`, `data/TOOLS.md`, `data/OBJECTIVES.md` or ask Luna to set them via chat.
 
 ## License
