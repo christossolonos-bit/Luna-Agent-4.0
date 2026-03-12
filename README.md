@@ -9,8 +9,6 @@ Luna is a personal AI companion and automation assistant: Discord bot, web chat 
 - **4-layer memory** — Core, long-term, short-term, and working memory; survives restarts.
 - **Per-user profiles** — Luna gathers and remembers name, preferences, and facts; she can also ask what to put in SOUL.md, TOOLS.md, and OBJECTIVES.md and save your reply (like profile).
 - **Context compaction** — Long conversations are summarized so the context window stays manageable (OpenClaw-style).
-- **Style adaptation** — Learns your mannerisms and tone over time and adapts replies.
-
 ### Voice & media
 - **TTS** — Server-side speech on the host and in Discord voice channels (gTTS); optional auto-join and speak in configured text channels.
 - **Discord voice** — `!join` / `!leave`; Luna speaks replies in VC when invited. YouTube music: `!play`, `!pause`, `!resume`, `!skip`, `!queue`, `!stop`.
@@ -18,7 +16,6 @@ Luna is a personal AI companion and automation assistant: Discord bot, web chat 
 ### Files & execution
 - **Luna projects** — Read, write, edit, list only inside the project sandbox; file creation requires confirmation.
 - **Run scripts** — `!run <path>` runs a `.py` script in Luna projects after you confirm.
-- **Do / research** — Ask Luna to “do” something; she searches, proposes an action (e.g. create a file or add a reminder), and runs it after you say yes.
 
 ### Identity & skills
 - **SOUL.md, TOOLS.md, OBJECTIVES.md** — Loaded from `data/` and injected into the system prompt. Edit them directly or tell Luna to set them; she asks what to put in each and saves your next message to the file.
@@ -34,10 +31,8 @@ Luna is a personal AI companion and automation assistant: Discord bot, web chat 
 - **News** — Fetch and show latest world news on request.
 - **Search** — Open Google, fetch results, and recommend the best link (Ollama).
 
-### Agents & tools
-- **Small agents** — “Create an agent that …” / `!agent create <description>`: Luna generates name and instructions, writes a Python implementation, checks it with the coder model, and can open Cursor with the file. `!agents` lists them.
+### Tools & control
 - **Mistake analysis** — Ask “why did you make a mistake?” for an explanation; “retry and find the solution” triggers multi-strategy retry in one session. Successful fixes are stored and preferred next time.
-- **Action log** — `data/action_log.jsonl` records file creates, shares, script runs, reminder appends, and agent creates (audit trail).
 - **Objectives** — `data/OBJECTIVES.md` defines rules Luna must follow; she can ask you what to put there and record it.
 
 ### Security & control
@@ -68,7 +63,7 @@ Luna is a personal AI companion and automation assistant: Discord bot, web chat 
 ## Project layout
 
 - `bot.py` — Main entry: Discord bot, Flask web app, Ollama chat, TTS, automation, scheduler, memory, and identity injection.
-- `data/` — SOUL.md, TOOLS.md, OBJECTIVES.md, skills (`.md`), agents (JSON + scripts), action_log.jsonl, memory and profile storage.
+- `data/` — SOUL.md, TOOLS.md, OBJECTIVES.md, skills (`.md`), memory and profile storage.
 - `Luna projects/` — Sandbox for file read/write/edit and run scripts.
 - `static/` — Web UI (Jarvis-style chat).
 - `luna_conversation.py`, `luna_memory.py`, `luna_files.py` — Conversation history, memory layers, and sandboxed file access.

@@ -88,6 +88,11 @@ def _generate_lyrics_fallback(description: str, style: str) -> str:
     )
 
 
+def generate_lyrics(description: str, style: str = "neutral", bpm: int = 120) -> tuple[bool, str]:
+    """Employee: Lyricist. Generate song lyrics from description. Returns (ok, lyrics_text). Used by create_local_song_project."""
+    return _generate_lyrics_with_ollama(description, style, bpm)
+
+
 def _generate_lyrics_with_ollama(description: str, style: str, bpm: int) -> tuple[bool, str]:
     """
     Generate lyrics with local Ollama chat API.
@@ -566,7 +571,7 @@ def create_local_song_project(description: str) -> tuple[bool, str]:
         prompt_path = folder / "prompt.txt"
 
         _render_instrumental_wav(wav_path, bpm=bpm, minor=minor, duration_sec=180)
-        ok_lyrics, lyrics = _generate_lyrics_with_ollama(desc, style, bpm)
+        ok_lyrics, lyrics = generate_lyrics(desc, style, bpm)
         if not ok_lyrics:
             lyrics = _generate_lyrics_fallback(desc, style)
         lyrics_path.write_text(lyrics, encoding="utf-8")
