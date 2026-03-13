@@ -6128,6 +6128,7 @@ Commands and their JSON shape (use these keys only):
 - Open Google and search for something (e.g. search for X, google X, look up X): {"command": "search", "query": "<search terms>"}
 - Run a Python script in Luna projects (e.g. run script.py, execute my_script.py): {"command": "run", "path": "<path to .py file>"}
 - Optimize yourself / analyze and optimize your code / self-optimize: {"command": "optimize"}
+- Add a skill / learn to do something / create a skill (e.g. add a skill that writes code, learn to access a website, create a skill for X): {"command": "create_feature", "description": "<full user request, e.g. add a skill that ... or learn to ...>"}
 - Add, change, or implement something in Luna's project/code (any natural-language request to change her code, add a feature, fix behavior, or "make it so that..."): {"command": "create_feature", "description": "<full user request in their words>"}
 - Show commands / help / what can you do: {"command": "files"}
 - Explain why the last action failed (e.g. why did that fail, explain last error): {"command": "explain_error"}
@@ -6147,6 +6148,7 @@ _NL_COMMAND_STARTS = (
     "whatsapp ", "facebook ", "instagram ", "youtube ", "optimize ", "add ",
     "make ", "change ", "update ", "implement ", "build ", "fix ", "improve ",
     "i want ", "i'd like ", "can you ", "could you ", "do ", "research ", "why ", "explain ",
+    "learn ", "learn to ",
 )
 _NL_COMMAND_START_EXACT = ("play", "search", "send", "create", "open", "call", "msg", "run", "google", "news", "optimize")
 
@@ -6281,6 +6283,7 @@ path: <path relative to repo root, e.g. data/skills/my_skill.md or plugins/helpe
 <full file content>
 END_LUNA_WRITE_REPO
 - You may create new files (e.g. in data/, data/skills/, or plugins/). You may edit bot.py or data/*.md if needed.
+- **Skills (no code change by user):** When the user asks to "add a skill", "learn to X", "create a skill that X", or customize behavior (e.g. "how to write code", "gain access to a website", "optimize your performance"), create a markdown file in data/skills/<topic>.md. Each skill file is loaded automatically into Luna's context and she follows it when relevant. Write clear, actionable instructions in the skill file (what to do, when, and how). Example: data/skills/write_code.md with steps for helping the user write code; data/skills/website_access.md for browser automation steps. No need to change bot.py for new skills—only new data/skills/*.md files.
 - Do not touch .env or .git. Do not remove existing functionality unless the user asked to.
 - If the feature is unclear or too large, reply in plain text asking for clarification and output no blocks."""
 
@@ -6311,11 +6314,13 @@ def _run_self_optimize(scope: str | None = None) -> str:
         ok, result = luna_write_repo_file(path, content)
         if ok:
             applied.append(path)
+            if path.replace("\\", "/").strip().startswith("data/"):
+                _invalidate_identity_cache()
         else:
             applied.append(f"{path} (fail: {result})")
     if not applied:
         return (reply.strip() or "I didn't generate any file changes.") + "\n\nNo repo files were updated."
-    return f"✅ Self-optimization applied to: {', '.join(applied)}.\n\nRestart Luna to load changes. You can push to GitHub when ready."
+    return f"✅ Self-optimization applied to: {', '.join(applied)}.\n\nRestart Luna to load code changes; new/updated skills in data/skills/ are loaded on the next message. You can push to GitHub when ready."
 
 
 def _run_create_feature(scope: str | None, description: str) -> str:
@@ -6333,11 +6338,13 @@ def _run_create_feature(scope: str | None, description: str) -> str:
         ok, result = luna_write_repo_file(path, content)
         if ok:
             applied.append(path)
+            if path.replace("\\", "/").strip().startswith("data/"):
+                _invalidate_identity_cache()
         else:
             applied.append(f"{path} (fail: {result})")
     if not applied:
         return (reply.strip() or "I couldn't generate file changes for that request.") + "\n\nTry describing the feature more concretely, or say what you want in your own files."
-    return f"✅ Feature added. Updated/created: {', '.join(applied)}.\n\nRestart Luna to load changes. You can push to GitHub when ready."
+    return f"✅ Feature added. Updated/created: {', '.join(applied)}.\n\nNew/updated skills (data/skills/*.md) load on the next message; restart Luna only for code changes. You can push to GitHub when ready."
 
 
 def _run_do_research_and_propose(scope: str | None, description: str) -> str:
