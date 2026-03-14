@@ -16,6 +16,7 @@ import os
 import random
 import re
 import subprocess
+import uuid
 import sys
 import tempfile
 import threading
@@ -34,28 +35,9 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 
-from luna_files import (
-    safe_path as luna_safe_path,
-    read_file as luna_read_file,
-    write_file as luna_write_file,
-    list_dir as luna_list_dir,
-    modify_file as luna_modify_file,
-    ALLOWED_BASE as LUNA_PROJECTS_BASE,
-    REPO_ROOT as LUNA_REPO_ROOT,
-    read_repo_file as luna_read_repo_file,
-    write_repo_file as luna_write_repo_file,
-)
+from luna_files import REPO_ROOT as LUNA_REPO_ROOT, write_file as luna_write_file  # agents .py writes go under Luna projects/agents
 from shadow_agent import strip_shadow_prefix, run_shadow as shadow_run
-import george  # Shadow's sub-agent for scheduling X/Facebook shares
 import celine  # Sub-agent for voice clips: transcribe and decide Shadow vs Luna
-
-
-def _open_file_in_editor(relative_path: str) -> bool:
-    """Open a file from Luna projects in the default app (e.g. Notepad for .txt). Returns True if opened."""
-    full = luna_safe_path(relative_path)
-    if full is None or not full.is_file():
-        return False
-    return _open_file_by_path(str(full))
 
 
 def _open_file_by_path(absolute_path: str) -> bool:
@@ -85,6 +67,7 @@ from luna_memory import (
     clear_all_memories,
     merge_memories,
 )
+from luna_brain import brain_step, brain_should_remember
 from luna_profile import (
     get_profile_prompt,
     get_profile,
@@ -95,24 +78,19 @@ from luna_profile import (
     merge_profiles,
 )
 from luna_conversation import get_recent_conversation, append_exchange, merge_conversations, get_recent_user_messages, count_user_messages
-from local_music import create_local_song_project, generate_lyrics as _lyricist_generate
 
-# Ollama defaults (override in .env: OLLAMA_BASE_URL, OLLAMA_MODEL)
+# Ollama: two modes — Luna (chat) uses OLLAMA_CHAT_MODEL (e.g. Llama 3.2); Shadow (commands, code) uses OLLAMA_MODEL (Qwen 2.5 Coder).
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b-instruct")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b-instruct")  # Shadow: commands, create code, agents
+OLLAMA_CHAT_MODEL = os.environ.get("OLLAMA_CHAT_MODEL", "llama3.2:latest").strip() or "llama3.2:latest"  # Luna: normal chatting
 
 LUNA_SYSTEM_PROMPT = """You are Luna, a friendly AI companion. You're warm, helpful, and a bit playful. Keep replies concise (a few sentences). Speak in first person as Luna.
-File access: Luna has access to the "Luna projects" folder. When the user asks you to create a website, game, or any file(s) and wants them saved there, you MUST save them via the system—do not only paste code in chat. For every file to save, add this exact block (one block per file). Put all blocks at the end of your reply with no other text after the last END_LUNA_WRITE.
-LUNA_WRITE_FILE
-path: <path>
----
-<content>
-END_LUNA_WRITE
-Use path relative to Luna projects (e.g. index.html, css/styles.css, js/game.js). For multiple files (e.g. HTML + CSS + JS for a game), output multiple blocks back-to-back. In your reply text, briefly say what you prepared and that they can reply "yes" to create the files in Luna projects. Do not mention the block names. Never say you have already created or saved the file—creation happens only after the user replies "yes". Do not tell the user to use !write. For read/list/edit only, tell them to use !read, !list, !edit.
-You have a permanent user profile (name, location, occupation, interests, birthday). When you don't know a profile field, politely ask the user; their answers are saved automatically."""
+You have a permanent user profile (name, location, occupation, interests, birthday). When you don't know a profile field, politely ask the user; their answers are saved automatically. You remember things the user tells you using your 4-layer memory."""
 
 # SOUL.md + TOOLS.md + skills (OpenClaw-style): loaded from data/ and injected into the system prompt.
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_REMINDERS_FILE = os.path.join(_DATA_DIR, "reminders.json")
+_reminders_lock = threading.Lock()
 _SOUL_PATH = os.path.join(_DATA_DIR, "SOUL.md")
 _TOOLS_PATH = os.path.join(_DATA_DIR, "TOOLS.md")
 _OBJECTIVES_PATH = os.path.join(_DATA_DIR, "OBJECTIVES.md")
@@ -295,7 +273,6 @@ OLLAMA_MODEL_SMALL = os.environ.get("OLLAMA_MODEL_SMALL", "").strip() or OLLAMA_
 #
 #   SEARCH_PICKER — Pick best search result + short reason. Model: OLLAMA_MODEL_SMALL. Used by: Boss in _open_google_search.
 #   COPYWRITER   — Short copy: WhatsApp message from context, YouTube comment from transcript/context. Model: OLLAMA_MODEL. Used by: msg flow, YT comment flow.
-#   LYRICIST     — Song lyrics from description (local music). In local_music. Used by: create_local_song_project.
 #   RECEPTIONIST — Return "what can you do" / commands help (no Ollama). Used by: Boss when user asks for help.
 #   NEWSROOM     — Fetch and format world news (no Ollama). Used by: Boss when user says news.
 #
@@ -304,7 +281,6 @@ EMPLOYEE_SCRIBE = "Scribe"
 EMPLOYEE_LUNA = "Luna"
 EMPLOYEE_SEARCH_PICKER = "SearchPicker"
 EMPLOYEE_COPYWRITER = "Copywriter"
-EMPLOYEE_LYRICIST = "Lyricist"
 EMPLOYEE_RECEPTIONIST = "Receptionist"
 EMPLOYEE_NEWSROOM = "Newsroom"
 
@@ -417,7 +393,6 @@ _x_bootstrap_running = False
 _fb_share_lock = threading.Lock()
 _fb_bootstrap_lock = threading.Lock()
 _fb_bootstrap_running = False
-# George (Shadow's scheduler) uses GEORGE_SCHEDULE_X_TIMES and GEORGE_SCHEDULE_FACEBOOK_TIMES in george.py (default: X 10:00 & 18:00, Facebook 11:00 & 19:00).
 _yt_comment_lock = threading.Lock()
 _yt_bootstrap_lock = threading.Lock()
 _yt_bootstrap_running = False
@@ -1216,10 +1191,11 @@ def _build_system_prompt(base: str | None, memory_scope: str | None) -> str | No
 
 
 def _try_capture_memory(scope: str, user_message: str) -> None:
-    """If user said something worth remembering, store in the right layer (core vs long-term). Also capture goals."""
+    """If user said something worth remembering, store in the right layer (core vs long-term). Luna's brain (neuron layer) gates learning and can add from conversation."""
     text = (user_message or "").strip()
     if not text or not scope:
         return
+    brain = brain_step(scope, text, context={})
     # "my goal is X" / "remember my goal: X" -> goals list (Luna references in prompt)
     m = re.search(r"\b(?:my goal is|remember my goal[:\s]+)\s*(.+?)(?:\.|$)", text, re.I | re.S)
     if m:
@@ -1260,6 +1236,13 @@ def _try_capture_memory(scope: str, user_message: str) -> None:
         pref = m.group(1).strip()[:300]
         if len(pref) >= 2:
             add_memory(scope, f"The user likes/prefers: {pref}.")
+        return
+    # Brain: learn from conversation when the neuron layer says "should remember" (no explicit phrase)
+    if brain.get("should_remember") and not brain.get("should_add_core"):
+        if 10 <= len(text) <= 800:
+            add_memory(scope, text[:500])
+    elif brain.get("should_add_core") and 10 <= len(text) <= 800:
+        add_core_memory(scope, text[:500])
 
 
 def _try_capture_profile(scope: str, user_message: str) -> None:
@@ -1396,13 +1379,61 @@ def ollama_chat(
         return f"Something went wrong: {e}"
 
 
+def _run_create_agent_code(user_request: str, open_in_notepad: bool = True) -> tuple[bool, str]:
+    """Generate Python code with Qwen 2.5 Coder, save to Luna projects/agents/<name>.py, optionally open in Notepad. Returns (ok, message)."""
+    request = (user_request or "").strip()
+    if not request or len(request) > 2000:
+        return False, "Give a short description of what the script should do (e.g. 'a script that fetches the weather' or 'code to list files in a folder')."
+    system = (
+        "You are a Python code generator. The user will describe what they want. "
+        "Output only valid Python code. Use a single markdown code block with language python, e.g. ```python\\n...\\n```. "
+        "No explanation outside the block. Keep the code concise and runnable."
+    )
+    try:
+        reply = ollama_chat(
+            f"Generate Python code for the following request. Output only the code in a ```python code block.\n\nRequest: {request}",
+            system_prompt=system,
+            memory_scope=None,
+            message_history=None,
+            model=OLLAMA_MODEL,
+        )
+    except Exception as e:
+        return False, f"Could not generate code: {e}"
+    if not reply or not reply.strip():
+        return False, "No code was generated. Try a clearer description."
+    # Extract code from ```python ... ``` or ``` ... ```
+    code = reply.strip()
+    for pattern in (r"```python\s*\n(.*?)```", r"```\s*\n(.*?)```"):
+        m = re.search(pattern, code, re.DOTALL | re.IGNORECASE)
+        if m and m.group(1).strip():
+            code = m.group(1).strip()
+            break
+    if not code or len(code) > 100_000:
+        return False, "No valid code block found in the reply or output too large."
+    # Safe filename under agents/: only alphanumeric, underscore, hyphen; default new_script.py
+    slug = re.sub(r"[^\w\s-]", "", request.lower())[:30].strip().replace(" ", "_") or "new_script"
+    slug = re.sub(r"_+", "_", slug).strip("_") or "new_script"
+    base = slug if slug.endswith(".py") else f"{slug}.py"
+    if not base.endswith(".py"):
+        base += ".py"
+    rel_path = f"agents/{base}"
+    ok, result = luna_write_file(rel_path, code)
+    if not ok:
+        return False, result
+    if open_in_notepad and result:
+        _open_file_by_path(result)
+    return True, f"Created **{rel_path}** and opened in Notepad." if open_in_notepad else f"Created **{rel_path}**."
+
+
 def ollama_chat_stream(
     user_message: str,
     system_prompt: str | None = None,
     memory_scope: str | None = None,
     message_history: list[dict] | None = None,
+    model: str | None = None,
 ):
-    """Stream Ollama reply: yields content deltas (str). Used by Boss (Luna) for main chat on web. Uses OLLAMA_MODEL."""
+    """Stream Ollama reply: yields content deltas (str). For Luna chat use model=OLLAMA_CHAT_MODEL; default OLLAMA_MODEL."""
+    use_model = (model or OLLAMA_MODEL).strip() or OLLAMA_MODEL
     prompt = _build_system_prompt(system_prompt, memory_scope)
     messages = []
     if prompt:
@@ -1414,7 +1445,7 @@ def ollama_chat_stream(
             if content and role in ("user", "assistant"):
                 messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_message})
-    body = json.dumps({"model": OLLAMA_MODEL, "messages": messages, "stream": True}).encode()
+    body = json.dumps({"model": use_model, "messages": messages, "stream": True}).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/chat",
         data=body,
@@ -1639,6 +1670,142 @@ def _play_reply_tts_on_pc(reply: str) -> None:
     t.start()
 
 
+# --- Reminders: store in data/reminders.json; background task sends Discord DM + TTS at set time ---
+
+def _load_reminders() -> list[dict]:
+    with _reminders_lock:
+        try:
+            if os.path.isfile(_REMINDERS_FILE):
+                with open(_REMINDERS_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            pass
+    return []
+
+
+def _save_reminders(reminders: list[dict]) -> None:
+    with _reminders_lock:
+        try:
+            os.makedirs(os.path.dirname(_REMINDERS_FILE), exist_ok=True)
+            with open(_REMINDERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(reminders, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def add_reminder(time_str: str, message: str, discord_user_id: str, recurring: str | None = None) -> str:
+    """Add a reminder. time_str like '19:00'. recurring 'daily' or None. Returns reminder id."""
+    tid = str(uuid.uuid4())[:8]
+    entry = {
+        "id": tid,
+        "time": time_str,
+        "message": (message or "").strip() or "do something",
+        "discord_user_id": str(discord_user_id),
+        "recurring": recurring,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    reminders = _load_reminders()
+    reminders.append(entry)
+    _save_reminders(reminders)
+    return tid
+
+
+def get_due_reminders() -> list[dict]:
+    """Return reminders that are due right now (current local time HH:MM). Recurring daily only once per day."""
+    now = datetime.now()
+    current_time = now.strftime("%H:%M")
+    today = now.strftime("%Y-%m-%d")
+    reminders = _load_reminders()
+    due = []
+    for r in reminders:
+        if (r.get("time") or "").strip() != current_time:
+            continue
+        if r.get("recurring") == "daily":
+            if (r.get("last_sent") or "") == today:
+                continue
+        due.append(r)
+    return due
+
+
+def remove_reminder_by_id(rid: str) -> None:
+    reminders = [r for r in _load_reminders() if r.get("id") != rid]
+    _save_reminders(reminders)
+
+
+async def _send_reminder_dm(reminder: dict) -> None:
+    """Send Discord DM to user with text + TTS voice note (Hey, remember you need to <message>)."""
+    user_id_str = (reminder.get("discord_user_id") or "").strip()
+    if not user_id_str:
+        return
+    try:
+        user_id = int(user_id_str)
+    except ValueError:
+        return
+    msg_text = (reminder.get("message") or "do something").strip()
+    full_text = f"Hey, remember you need to {msg_text}"
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        if user is None:
+            return
+        channel = user.dm_channel or await user.create_dm()
+        await channel.send(full_text)
+        mp3_bytes = await _get_tts_for_discord(full_text)
+        if mp3_bytes:
+            await channel.send(file=discord.File(io.BytesIO(mp3_bytes), filename="reminder.mp3"))
+    except Exception:
+        pass
+    rid = reminder.get("id")
+    if rid:
+        if reminder.get("recurring") != "daily":
+            remove_reminder_by_id(rid)
+        else:
+            today = datetime.now().strftime("%Y-%m-%d")
+            reminders = _load_reminders()
+            for r in reminders:
+                if r.get("id") == rid:
+                    r["last_sent"] = today
+                    break
+            _save_reminders(reminders)
+
+
+def _parse_reminder_time(s: str) -> str | None:
+    """Parse '7pm', '7:00 pm', '19:00', '9am' -> '19:00' or '09:00'. Returns None if invalid."""
+    s = (s or "").strip().lower()
+    if not s:
+        return None
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", s.replace(" ", ""))
+    if not m:
+        return None
+    h, mi, ampm = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").strip()
+    if ampm == "pm" and h != 12:
+        h += 12
+    elif ampm == "am" and h == 12:
+        h = 0
+    elif not ampm and h >= 24:
+        return None
+    if h < 0 or h > 23 or mi < 0 or mi > 59:
+        return None
+    return f"{h:02d}:{mi:02d}"
+
+
+async def _reminder_loop() -> None:
+    """Background: every minute check for due reminders and send DM + TTS to user."""
+    await bot.wait_until_ready()
+    last_minute = ""
+    while True:
+        try:
+            now = datetime.now()
+            this_minute = now.strftime("%H:%M")
+            if this_minute != last_minute:
+                last_minute = this_minute
+                for r in get_due_reminders():
+                    await _send_reminder_dm(r)
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
 def _can_use_suno_discord(author_id: int) -> bool:
     """Allow Suno automation on Discord only for linked user or configured admin."""
     if _discord_admin_id_int is not None and author_id == _discord_admin_id_int:
@@ -1756,26 +1923,6 @@ def _extract_suno_description(text: str) -> str:
     patterns = [
         r"^\s*(?:luna[\s,:-]*)?(?:create|make)\s+(?:me\s+)?(?:a\s+)?song(?:\s+(?:about|for|with))?\s*[:,-]?\s*(.+)$",
         r"^\s*(?:luna[\s,:-]*)?song\s*[:,-]\s*(.+)$",
-    ]
-    for p in patterns:
-        m = re.match(p, raw, re.IGNORECASE | re.DOTALL)
-        if m:
-            return (m.group(1) or "").strip()
-    return ""
-
-
-def _extract_local_song_description(text: str) -> str:
-    """Extract prompt for local song/lyrics generation."""
-    raw = (text or "").strip()
-    if not raw:
-        return ""
-    low = raw.lower()
-    if low.startswith("!local_song "):
-        return raw[len("!local_song ") :].strip()
-    if low.startswith("!local song "):
-        return raw[len("!local song ") :].strip()
-    patterns = [
-        r"^\s*(?:luna[\s,:-]*)?(?:create|make|generate)\s+(?:a\s+)?local\s+(?:song|music)(?:\s+(?:about|for|with))?\s*[:,-]?\s*(.+)$",
     ]
     for p in patterns:
         m = re.match(p, raw, re.IGNORECASE | re.DOTALL)
@@ -2058,50 +2205,14 @@ def _fetch_search_results(query: str, max_results: int = 10) -> list[dict]:
 
 
 def _recommend_best_search_result(query: str, results: list[dict]) -> str:
-    """Use Ollama to pick the best result and return a short recommendation (and best URL)."""
+    """Return the first result as recommendation (command-only mode: no Ollama)."""
     if not results:
         return ""
-    lines = []
-    for i, r in enumerate(results[:8], 1):
-        title = (r.get("title") or "").strip()
-        url = (r.get("url") or "").strip()
-        snippet = (r.get("snippet") or "").strip()
-        lines.append(f"{i}. {title}\n   URL: {url}\n   {snippet[:180]}")
-    block = "\n\n".join(lines)
-    prompt = (
-        f"Search query: \"{query}\"\n\nTop results:\n{block}\n\n"
-        "Which single result is the best to recommend? Reply in 2-4 short sentences: say which one (title or number) and why. Then on a new line write exactly: BEST_URL: followed by that result's URL. Be concise."
-    )
-    try:
-        reply = ollama_chat(
-            prompt,
-            system_prompt="You are a search assistant. Pick the single best result and give its URL. Output BEST_URL: <url> on its own line.",
-            memory_scope=None,
-            message_history=None,
-            model=OLLAMA_MODEL_SMALL,
-        )
-        reply = (reply or "").strip()
-        if not reply:
-            return ""
-        # Extract BEST_URL if present
-        best_url = None
-        for line in reply.split("\n"):
-            line = line.strip()
-            if line.upper().startswith("BEST_URL:"):
-                best_url = line[9:].strip().strip("[]()")
-                break
-        if best_url and not best_url.startswith("http"):
-            best_url = None
-        if reply and not best_url and results:
-            best_url = results[0].get("url")
-        if best_url:
-            return reply + f"\n\n**Best link:** {best_url}"
-        return reply
-    except Exception:
-        if results:
-            r = results[0]
-            return f"Top result: **{r.get('title', '')}** — {r.get('url', '')}"
-        return ""
+    r = results[0]
+    title = (r.get("title") or "").strip()
+    url = (r.get("url") or "").strip()
+    snippet = (r.get("snippet") or "").strip()[:180]
+    return f"Top result: **{title}** — {url}\n{snippet}"
 
 
 def _open_google_search(query: str) -> tuple[bool, str]:
@@ -2128,40 +2239,6 @@ def _open_google_search(query: str) -> tuple[bool, str]:
         except Exception:
             pass
         return False, str(e)[:200]
-
-
-def _run_script_in_luna_projects(relative_path: str) -> tuple[bool, str]:
-    """Run a Python script under Luna projects. Path is relative; only .py allowed. Returns (ok, output_or_error)."""
-    relative_path = (relative_path or "").strip().replace("\\", "/").lstrip("/")
-    if not relative_path:
-        return False, "No path given."
-    path = luna_safe_path(relative_path)
-    if path is None:
-        return False, "Path not allowed (only inside Luna projects)."
-    if not path.is_file():
-        return False, f"Not a file or not found: {relative_path}"
-    if path.suffix.lower() != ".py":
-        return False, "Only .py scripts can be run. Use a path like script.py or folder/script.py"
-    try:
-        cwd = str(path.parent)
-        result = subprocess.run(
-            [sys.executable, "-u", str(path)],
-            cwd=cwd,
-            timeout=_RUN_SCRIPT_TIMEOUT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        out = (result.stdout or "").strip()
-        err = (result.stderr or "").strip()
-        if result.returncode != 0:
-            return False, f"Exit {result.returncode}\n{err or out or 'No output'}"
-        return True, out if out else "(Script ran with no output.)"
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {_RUN_SCRIPT_TIMEOUT}s."
-    except Exception as e:
-        return False, str(e)[:300]
 
 
 # Conversation starters: skip Ollama intent check to speed up plain chat.
@@ -2196,7 +2273,6 @@ def _intent_requires_tool_call(text: str) -> bool:
         r"\b(?:instagram|insta|ig)\b.*\b(?:message|dm|send)\b",
         r"\b(?:create|make)\b.*\b(?:song)\b",
         r"\b(?:open|use)\b.*\bsuno\b",
-        r"\b(?:local\s+song|local\s+music)\b",
     )
     if any(re.search(p, low, re.IGNORECASE) for p in strong_yes_patterns):
         return True
@@ -5670,17 +5746,10 @@ def _stream_tts_chunks(text: str):
     yield "event: done\ndata: {}\n\n"
 
 
-# Last automation failure (for "why did you make a mistake?" and "retry and find the solution")
+# Last automation failure (for "retry" — analyze and retry with different strategies)
 _last_automation_command: str | None = None
 _last_automation_error: str | None = None
 _last_automation_params: dict = {}
-
-# Pending file creation: scope -> {path, content}. User must reply "yes" to confirm (admin only on Discord).
-_pending_writes: dict[str, dict] = {}
-
-# Pending "run script": scope -> {path}. User says yes -> Luna runs the .py file in Luna projects.
-_pending_run: dict[str, dict] = {}
-_RUN_SCRIPT_TIMEOUT = 120  # seconds
 
 # Shadow action log (audit trail): one JSONL line per Shadow command run.
 _ACTION_LOG_PATH = os.path.join(_DATA_DIR, "action_log.jsonl")
@@ -5704,39 +5773,6 @@ def _log_shadow_action(cmd: str, params: dict, reply: str) -> None:
 
 # Pending "record to identity file": scope -> "SOUL"|"TOOLS"|"OBJECTIVES". Next user message is saved to that file (like profile).
 _pending_file_update: dict[str, str] = {}
-
-# Pending "do" action (Shadow): scope -> {description, path, content}. User says yes -> execute file write (Luna projects or data/).
-_pending_do_action: dict[str, dict] = {}
-
-# Pending agent name: after Shadow creates an agent, scope -> { "filename": str }. Next user message = agent name; we register and clear.
-_pending_agent_name: dict[str, dict] = {}
-
-# Agents registry: name -> filename (in data/agents/). Enables "Shadow, run Hank".
-_AGENTS_REGISTRY_PATH = os.path.join(_DATA_DIR, "agents_registry.json")
-_agents_registry_lock = threading.Lock()
-
-
-def _load_agents_registry() -> dict:
-    """Load { "AgentName": "agent_20260101_xxx.py" } from disk."""
-    with _agents_registry_lock:
-        try:
-            if os.path.isfile(_AGENTS_REGISTRY_PATH):
-                with open(_AGENTS_REGISTRY_PATH, encoding="utf-8") as f:
-                    out = json.load(f)
-                return out if isinstance(out, dict) else {}
-        except Exception:
-            pass
-    return {}
-
-
-def _save_agents_registry(registry: dict) -> None:
-    with _agents_registry_lock:
-        try:
-            os.makedirs(os.path.dirname(_AGENTS_REGISTRY_PATH), exist_ok=True)
-            with open(_AGENTS_REGISTRY_PATH, "w", encoding="utf-8") as f:
-                json.dump(registry, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
 
 # User style (Luna): per-scope short summary of reply length/tone; injected into prompt. Updated in background.
 _USER_STYLE_FILE = os.path.join(_DATA_DIR, "user_style.json")
@@ -5869,15 +5905,6 @@ def _is_confirm_message(msg: str) -> bool:
     if t.startswith("yes ") or t.startswith("yes,") or t.startswith("yes."):
         return True
     return False
-
-
-def _pending_write_scope_for_web() -> str | None:
-    """Return the scope key that has a pending write for the web UI (check both possible keys)."""
-    if LINKED_SCOPE and LINKED_SCOPE in _pending_writes:
-        return LINKED_SCOPE
-    if "web" in _pending_writes:
-        return "web"
-    return None
 
 
 def _normalize_luna_path(path: str) -> str:
@@ -6082,17 +6109,10 @@ def _extract_code_blocks_from_reply(reply: str) -> list[dict]:
 
 # Intent template for "commands" / "help" — reply without calling Ollama
 LUNA_COMMANDS_REPLY = (
-    "**Luna** = CEO (communicates with you; chat, memory, goals, style). **Shadow** = Manager (executes all commands and runs the agents under him). Say **Shadow, [what to do]** for any action (e.g. Shadow, share a song on X; Shadow, message Marios; Shadow, do …; Shadow, create an agent that… — then you'll be asked for a name, e.g. Hank; Shadow, run Hank to run it; Shadow, explain last error). You can also ask Luna for an action — she delegates to Shadow.\n\n"
-    "**Luna file access** (only inside Luna projects):\n"
-    "• !read <path> — read file\n"
-    "• !write <path> <content> — write file\n"
-    "• !list [path] — list directory\n"
-    "• !edit <path> <old> -> <new> — replace text in file\n"
+    "**Luna** = chat with me (Llama). **Shadow** = commands & code (Qwen). Chat normally with Luna; for actions say **Shadow, [what to do]** (e.g. Shadow, news; Shadow, create a script that…). If something failed, say **retry**. **!help** for the full list.\n\n"
     "• !news — latest world news headlines\n"
     "• !search <query> / \"search for …\" / \"google …\" — open Google and search\n"
-    "• !run <path> / \"run script.py\" — run a .py script in Luna projects (confirm with yes)\n"
     "• !suno <description> — open Suno and create a song\n"
-    "• !local_song <description> — generate local instrumental + lyrics files\n"
     "• !share_song (or !share song) — share a random YouTube channel song to X\n"
     "• !share_facebook (or !share facebook) — share to Facebook\n"
     "• !yt_comment <youtube_url> — transcribe and post a YouTube comment\n"
@@ -6103,8 +6123,9 @@ LUNA_COMMANDS_REPLY = (
     "• !join / !leave — voice; !play or say **play** <artist/song> (e.g. play AC/DC); if multiple: **Which song?** — reply with number or name; !pause / !skip / !stop / !queue — music\n"
     "• !call <contact> — WhatsApp Desktop: open app, find Call then Voice to start voice call (Windows)\n"
     "• !msg <contact> [description] — WhatsApp Web: open chat and send message (default or your text, from Luna)\n"
-    "• !optimize — Luna analyzes and optimizes her own code (repo only; you push to GitHub)\n"
-    "• \"add this feature\" / \"create [X] in your files\" — Luna adds the feature to her project"
+    "• **create code** — say e.g. \"Shadow, create a script that fetches the weather\" → Qwen generates Python, saved to Luna projects/agents/*.py and opened in Notepad\n"
+    "• **remind me at 7pm to …** — I'll DM you on Discord at that time with a text + voice note (e.g. remind me at 7pm to take my medicine)\n"
+    "• **retry** (or \"try again\") — if the last action failed, I'll analyze and retry with different strategies (up to 2 attempts)\n"
 )
 
 # Natural language command parsing: system prompt for Ollama to map user message → command + params
@@ -6116,25 +6137,13 @@ Commands and their JSON shape (use these keys only):
 - Get latest news / headlines: {"command": "news"}
 - Play music on Discord (e.g. play X, play a song): {"command": "play", "query": "<song name or empty>"}
 - Create a song on Suno: {"command": "suno", "description": "<song idea>"}
-- Generate a local song (instrumental + lyrics): {"command": "local_song", "description": "<song idea>"}
 - Share a song to X/Twitter: {"command": "share_x"}
 - Share a song to Facebook: {"command": "share_facebook"}
 - Comment on a YouTube video: {"command": "yt_comment", "video_url": "<url>"}
 - Send an Instagram DM: {"command": "ig_dm", "target": "<username or thread url>", "message": "<optional text>"}
 - Send a Facebook Messenger message: {"command": "fb_msg", "target": "<name or username>", "message": "<optional text>"}
-- Read a file in Luna projects: {"command": "read", "path": "<path>"}
-- List files in Luna projects: {"command": "list", "path": "<optional path>"}
-- Write content to a file in Luna projects: {"command": "write", "path": "<path>", "content": "<text>"}
 - Open Google and search for something (e.g. search for X, google X, look up X): {"command": "search", "query": "<search terms>"}
-- Run a Python script in Luna projects (e.g. run script.py, execute my_script.py): {"command": "run", "path": "<path to .py file>"}
-- Optimize yourself / analyze and optimize your code / self-optimize: {"command": "optimize"}
-- Add a skill / learn to do something / create a skill (e.g. add a skill that writes code, learn to access a website, create a skill for X): {"command": "create_feature", "description": "<full user request, e.g. add a skill that ... or learn to ...>"}
-- Add, change, or implement something in Luna's project/code (any natural-language request to change her code, add a feature, fix behavior, or "make it so that..."): {"command": "create_feature", "description": "<full user request in their words>"}
 - Show commands / help / what can you do: {"command": "files"}
-- Explain why the last action failed (e.g. why did that fail, explain last error): {"command": "explain_error"}
-- Research how to do something, then do it after user confirms (e.g. do X, research how to X): {"command": "do", "description": "<what to do>"}
-- Create a small agent/script that does something (e.g. create an agent that X): {"command": "agent_create", "description": "<what the agent should do>"}
-- Run a registered agent by name (e.g. run Hank, run George): {"command": "run_agent", "name": "<agent name>"}
 - Join voice channel: {"command": "join"}
 - Leave voice: {"command": "leave"}
 - Pause / resume / skip / stop music, show queue: {"command": "pause"}, {"command": "resume"}, {"command": "skip"}, {"command": "stop"}, {"command": "queue"}
@@ -6145,12 +6154,12 @@ Rules: Output ONLY valid JSON. Omit optional params if not mentioned. For "msg",
 _NL_COMMAND_STARTS = (
     "play ", "search ", "send ", "create ", "open ", "call ", "msg ", "message ",
     "remind ", "share ", "post ", "run ", "google ", "news ", "suno ", "comment ",
-    "whatsapp ", "facebook ", "instagram ", "youtube ", "optimize ", "add ",
+    "whatsapp ", "facebook ", "instagram ", "youtube ", "add ",
     "make ", "change ", "update ", "implement ", "build ", "fix ", "improve ",
     "i want ", "i'd like ", "can you ", "could you ", "do ", "research ", "why ", "explain ",
     "learn ", "learn to ",
 )
-_NL_COMMAND_START_EXACT = ("play", "search", "send", "create", "open", "call", "msg", "run", "google", "news", "optimize")
+_NL_COMMAND_START_EXACT = ("play", "search", "send", "create", "open", "call", "msg", "run", "google", "news")
 
 
 def _message_likely_command(msg: str) -> bool:
@@ -6218,11 +6227,6 @@ def employee_copywriter_whatsapp(description: str) -> str:
     return _generate_whatsapp_message_from_context(description)
 
 
-def employee_lyricist(description: str, style: str = "neutral", bpm: int = 120) -> tuple[bool, str]:
-    """Employee: Lyricist. Song lyrics from description (local music). Delegates to local_music.generate_lyrics. Used by create_local_song_project."""
-    return _lyricist_generate(description, style, bpm)
-
-
 def employee_receptionist(msg: str) -> str | None:
     """Employee: Receptionist. Returns commands/help template if user asks for help. No Ollama. Used by Boss via _get_command_intent_reply."""
     return _get_command_intent_reply(msg)
@@ -6233,292 +6237,115 @@ def employee_newsroom(limit: int = 8) -> tuple[bool, str]:
     return _fetch_world_news(limit)
 
 
+# Command-only mode: no Ollama/chatbot; Luna responds only to commands. This reply is used when user sends plain chat.
+COMMAND_ONLY_REPLY = (
+    "I'm **Luna** (chat) and **Shadow** (commands). Chat with me normally, or say **Shadow, <command>** (e.g. Shadow, news; Shadow, create a script that…). Use **!help** for the full list. If you were just chatting, my chat model may be unavailable — try `ollama run llama3.2:latest`."
+)
+
+
+def _parse_natural_language_command_heuristic(msg: str) -> tuple[str, dict] | None:
+    """Parse natural-language command using regex/keywords only (no Ollama). Returns (cmd, params) or None."""
+    raw = (msg or "").strip()
+    if not raw or raw.startswith("!"):
+        return None
+    low = raw.lower()
+
+    # news
+    if re.search(r"\b(?:news|headlines|latest\s+news|world\s+news|today'?s?\s+news)\b", low):
+        return ("news", {})
+
+    # share on X / Twitter
+    if re.search(r"\b(?:share\s+(?:a\s+)?song\s+on\s+(?:x|twitter)|share\s+on\s+x|share\s+on\s+twitter|post\s+to\s+x|tweet\s+my\s+song)\b", low):
+        return ("share_x", {})
+    # share on Facebook
+    if re.search(r"\b(?:share\s+(?:a\s+)?song\s+on\s+facebook|share\s+on\s+facebook|post\s+to\s+facebook)\b", low):
+        return ("share_facebook", {})
+
+    # YouTube comment: need URL in message
+    yt_url = _extract_youtube_video_url(raw)
+    if yt_url and re.search(r"\b(?:comment|reply)\b", low) and re.search(r"\b(?:youtube|yt|video)\b", low):
+        return ("yt_comment", {"video_url": yt_url})
+    if low.startswith(("comment on", "comment on this", "reply to this video")) and yt_url:
+        return ("yt_comment", {"video_url": yt_url})
+
+    # search / google
+    for prefix in ("search for ", "search ", "google ", "look up ", "find "):
+        if low.startswith(prefix):
+            q = raw[len(prefix):].strip()
+            if q:
+                return ("search", {"query": q})
+    if low.startswith("search") and len(raw) > 6:
+        return ("search", {"query": raw[6:].strip()})
+
+    # message/call (WhatsApp) — "message X" or "call X"
+    if re.match(r"^(?:send\s+)?(?:a\s+)?message\s+to\s+(.+)$", low):
+        contact = re.match(r"^(?:send\s+)?(?:a\s+)?message\s+to\s+(.+)$", low, re.IGNORECASE)
+        if contact:
+            rest = contact.group(1).strip()
+            desc = ""
+            if " saying " in rest or " with " in rest:
+                parts = re.split(r"\s+(?:saying|with)\s+", rest, 1, flags=re.IGNORECASE)
+                rest = (parts[0] or "").strip()
+                desc = (parts[1] or "").strip().strip('"') if len(parts) > 1 else ""
+            if rest:
+                return ("msg", {"contact": rest, "description": desc or ""})
+    if re.match(r"^call\s+(.+)$", low):
+        contact = re.match(r"^call\s+(.+)$", low, re.IGNORECASE)
+        if contact and contact.group(1).strip():
+            return ("call", {"contact": contact.group(1).strip()})
+
+    # Instagram DM
+    ig_target, ig_msg = _extract_instagram_dm_request(raw)
+    if ig_target:
+        return ("ig_dm", {"target": ig_target, "message": ig_msg or ""})
+
+    # Facebook Messenger
+    if re.search(r"\b(?:message|dm|send)\s+.*\b(?:messenger|facebook\s+message)\b", low) or re.search(r"\bmessenger\s+(?:message\s+)?(?:to\s+)?@?([a-z0-9._]+)", low):
+        m = re.search(r"(?:message|dm|send(?:\s+a)?\s+message(?:\s+to)?)\s+@?([a-z0-9._]{2,30})", low)
+        if m:
+            target = (m.group(1) or "").strip()
+            if target:
+                return ("fb_msg", {"target": target, "message": ""})
+        m = re.search(r"messenger\s+(?:message\s+)?(?:to\s+)?@?([a-z0-9._]{2,30})", low)
+        if m:
+            return ("fb_msg", {"target": (m.group(1) or "").strip(), "message": ""})
+
+    # create code / write script → Luna projects/agents/*.py (Qwen 2.5 Coder)
+    if re.search(r"\b(?:create|write|generate|make)\s+(?:a\s+)?(?:python\s+)?(?:script|code|\.py\s+file)\b", low):
+        return ("create_code", {"request": raw})
+    if re.search(r"\b(?:create|write|generate)\s+(?:some\s+)?code\s+(?:that|to)\b", low):
+        return ("create_code", {"request": raw})
+    if re.search(r"\bcode\s+(?:that|to)\s+", low) and re.search(r"\b(?:that|to)\s+(?:fetches|does|lists|sends|reads|writes)\b", low):
+        return ("create_code", {"request": raw})
+
+    # remind me at <time> to <message> → Discord DM + TTS at that time
+    m_remind = re.search(r"\bremind\s+me\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+to\s+(.+)", low, re.IGNORECASE | re.DOTALL)
+    if m_remind:
+        raw_time = (m_remind.group(1) or "").strip().replace(" ", "")
+        msg_part = (m_remind.group(2) or "").strip()[:500]
+        if msg_part and _parse_reminder_time(raw_time):
+            return ("remind", {"time": raw_time, "message": msg_part})
+
+    # help / commands
+    if re.search(r"\b(?:help|commands|what\s+can\s+you\s+do|list\s+commands)\b", low):
+        return ("files", {})
+
+    # play (Discord music)
+    if low.startswith("play ") or low == "play":
+        return ("play", {"query": raw[5:].strip() if low.startswith("play ") else ""})
+
+    return None
+
+
 def _parse_natural_language_command(msg: str) -> tuple[str, dict] | None:
-    """If the user message is a natural-language request for a Luna command, return (command_key, params). Else return None."""
-    msg = (msg or "").strip()
-    if not msg or msg.startswith("!"):
-        return None
-    try:
-        raw = ollama_chat(msg, system_prompt=_NL_COMMAND_SYSTEM, memory_scope=None, message_history=None, model=OLLAMA_MODEL_SMALL)
-        raw = (raw or "").strip()
-        if not raw or "command" not in raw:
-            return None
-        # Extract JSON (model might wrap in markdown or add text)
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        if start < 0 or end <= start:
-            return None
-        obj = json.loads(raw[start:end])
-        cmd = obj.get("command")
-        if cmd is None or (isinstance(cmd, str) and cmd.lower() in ("none", "null", "")):
-            return None
-        cmd = str(cmd).strip().lower()
-        if not cmd:
-            return None
-        params = {k: v for k, v in obj.items() if k != "command" and v is not None and (not isinstance(v, str) or v.strip())}
-        if isinstance(params.get("path"), str):
-            params["path"] = params["path"].strip()
-        if isinstance(params.get("query"), str):
-            params["query"] = params["query"].strip()
-        return (cmd, params)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return None
-
-
-# Self-optimize: Luna analyzes her repo and outputs LUNA_WRITE_REPO blocks. We apply them (no GitHub).
-_OPTIMIZER_SYSTEM = """You are Luna's self-optimizer. You will receive her project files (identity and start of bot). Propose concrete edits to make the codebase more efficient or clearer: shorten prompts, simplify logic, fix redundancy. Output each changed file as exactly one block in this format—no other format:
-LUNA_WRITE_REPO
-path: <path relative to repo root, e.g. data/SOUL.md or bot.py>
----
-<full new content of that file>
-END_LUNA_WRITE_REPO
-- Only output blocks for files you actually change. One block per file.
-- Do not touch .env or .git. Do not delete user data or Luna projects content.
-- If you have no safe improvements, reply with a short message and no blocks."""
-
-_CREATE_FEATURE_SYSTEM = """You are Luna's developer. The user asked to add a new feature to Luna's project. Implement it by editing or creating files in the repo. Output each file as exactly one block:
-LUNA_WRITE_REPO
-path: <path relative to repo root, e.g. data/skills/my_skill.md or plugins/helper.py>
----
-<full file content>
-END_LUNA_WRITE_REPO
-- You may create new files (e.g. in data/, data/skills/, or plugins/). You may edit bot.py or data/*.md if needed.
-- **Skills (no code change by user):** When the user asks to "add a skill", "learn to X", "create a skill that X", or customize behavior (e.g. "how to write code", "gain access to a website", "optimize your performance"), create a markdown file in data/skills/<topic>.md. Each skill file is loaded automatically into Luna's context and she follows it when relevant. Write clear, actionable instructions in the skill file (what to do, when, and how). Example: data/skills/write_code.md with steps for helping the user write code; data/skills/website_access.md for browser automation steps. No need to change bot.py for new skills—only new data/skills/*.md files.
-- Do not touch .env or .git. Do not remove existing functionality unless the user asked to.
-- If the feature is unclear or too large, reply in plain text asking for clarification and output no blocks."""
-
-
-def _run_self_optimize(scope: str | None = None) -> str:
-    """Luna analyzes her repo (identity + start of bot) and applies optimizations via LUNA_WRITE_REPO. Returns summary."""
-    parts = []
-    for name, rel in (("SOUL", "data/SOUL.md"), ("TOOLS", "data/TOOLS.md"), ("OBJECTIVES", "data/OBJECTIVES.md")):
-        ok, content = luna_read_repo_file(rel)
-        if ok:
-            parts.append(f"--- {name} ({rel}) ---\n{content[:8000]}")
-        else:
-            parts.append(f"--- {name} ({rel}): (missing or unreadable) ---")
-    bot_path = str(LUNA_REPO_ROOT / "bot.py") if hasattr(LUNA_REPO_ROOT, "__truediv__") else os.path.join(LUNA_REPO_ROOT, "bot.py")
-    if os.path.isfile(bot_path):
-        with open(bot_path, encoding="utf-8", errors="replace") as f:
-            bot_preview = f.read(12000)
-        parts.append(f"--- bot.py (first ~12k chars) ---\n{bot_preview}")
-    context = "\n\n".join(parts)
-    user_msg = context + "\n\n---\n\nReview the project files above. Suggest and apply optimizations (shorter prompts, clearer structure, less redundancy). Output LUNA_WRITE_REPO blocks for each file you change."
-    reply = ollama_chat(user_msg, system_prompt=_OPTIMIZER_SYSTEM, memory_scope=None, message_history=None, model=OLLAMA_MODEL)
-    writes = _parse_luna_repo_writes(reply)
-    applied = []
-    for w in writes:
-        path, content = w.get("path", "").strip(), w.get("content", "")
-        if not path:
-            continue
-        ok, result = luna_write_repo_file(path, content)
-        if ok:
-            applied.append(path)
-            if path.replace("\\", "/").strip().startswith("data/"):
-                _invalidate_identity_cache()
-        else:
-            applied.append(f"{path} (fail: {result})")
-    if not applied:
-        return (reply.strip() or "I didn't generate any file changes.") + "\n\nNo repo files were updated."
-    return f"✅ Self-optimization applied to: {', '.join(applied)}.\n\nRestart Luna to load code changes; new/updated skills in data/skills/ are loaded on the next message. You can push to GitHub when ready."
-
-
-def _run_create_feature(scope: str | None, description: str) -> str:
-    """User asked to add a feature; Luna generates code and writes to her repo via LUNA_WRITE_REPO."""
-    if not (description or "").strip():
-        return "What feature should I add? Describe it (e.g. 'add a command that lists my recent notes' or 'add a skill that reminds me to drink water')."
-    user_msg = f"The user asked Luna to add this feature to her project: {description.strip()}\n\nImplement it. Output LUNA_WRITE_REPO blocks for each new or modified file."
-    reply = ollama_chat(user_msg, system_prompt=_CREATE_FEATURE_SYSTEM, memory_scope=None, message_history=None, model=OLLAMA_MODEL)
-    writes = _parse_luna_repo_writes(reply)
-    applied = []
-    for w in writes:
-        path, content = w.get("path", "").strip(), w.get("content", "")
-        if not path:
-            continue
-        ok, result = luna_write_repo_file(path, content)
-        if ok:
-            applied.append(path)
-            if path.replace("\\", "/").strip().startswith("data/"):
-                _invalidate_identity_cache()
-        else:
-            applied.append(f"{path} (fail: {result})")
-    if not applied:
-        return (reply.strip() or "I couldn't generate file changes for that request.") + "\n\nTry describing the feature more concretely, or say what you want in your own files."
-    return f"✅ Feature added. Updated/created: {', '.join(applied)}.\n\nNew/updated skills (data/skills/*.md) load on the next message; restart Luna only for code changes. You can push to GitHub when ready."
-
-
-def _run_do_research_and_propose(scope: str | None, description: str) -> str:
-    """Shadow: research how to do X, propose one file write (Luna projects or data/), store in _pending_do_action. User says yes to execute."""
-    if not (description or "").strip():
-        return "What should I do? Say e.g. Shadow, do remind me to drink water at 10am, or Shadow, do add a note about X."
-    desc = description.strip()[:2000]
-    try:
-        step1 = ollama_chat(
-            f"The user wants to: {desc}\n\nIn 2-3 sentences, how would you do it? (e.g. create a reminder file, add a note in Luna projects, or a small data file.) Be concrete.",
-            system_prompt="You are a practical assistant. Suggest one concrete file-based action.",
-            memory_scope=None,
-            message_history=None,
-            model=OLLAMA_MODEL_SMALL,
-        )
-        step2 = ollama_chat(
-            f"Approach: {step1}\n\nOutput exactly ONE file to create. Path must be relative to 'Luna projects' (e.g. reminders.txt, notes/foo.txt) or 'data/' (e.g. data/reminders.txt).\nFormat, exactly:\nPATH: <path>\nCONTENT:\n<full content>\nEND",
-            system_prompt="Output only PATH: and CONTENT: as specified. Path under Luna projects or data/ only.",
-            memory_scope=None,
-            message_history=None,
-            model=OLLAMA_MODEL_SMALL,
-        )
-        path = ""
-        content = ""
-        if "PATH:" in step2 and "CONTENT:" in step2:
-            a, b = step2.split("CONTENT:", 1)
-            path = (a.split("PATH:")[-1].strip().split("\n")[0].strip()).strip()
-            content = b.split("END")[0].strip() if "END" in b else b.strip()
-        path = path.replace("\\", "/").strip()
-        if path.lower().startswith("luna projects/"):
-            path = path[14:].lstrip("/")
-        if not path:
-            path = f"note_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
-        if not path.startswith("data/") and luna_safe_path(path) is None:
-            path = f"note_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
-        if not scope:
-            return "Say that in chat so I can confirm before running."
-        _pending_do_action[scope] = {"description": desc, "path": path.replace("\\", "/").lstrip("/"), "content": content or "(no content)"}
-        return f"**Research:** {step1[:400]}\n\nI'll create/overwrite: **{path}**\n\nReply **yes** to run it, or **no** to cancel."
-    except Exception as e:
-        return f"Research failed: {e}"
-
-
-def _execute_pending_do_action(scope: str) -> str:
-    """Run the pending 'do' action: write file to Luna projects or data/. Clears _pending_do_action[scope]."""
-    pending = _pending_do_action.pop(scope, None)
-    if not pending or not pending.get("path"):
-        return "Nothing to run."
-    path = (pending.get("path") or "").strip().replace("\\", "/").lstrip("/")
-    content = pending.get("content") or ""
-    if path.startswith("data/"):
-        full = os.path.join(_DATA_DIR, path[5:].lstrip("/"))
-        try:
-            os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, "w", encoding="utf-8") as f:
-                f.write(content)
-            return f"✅ Wrote to {path}"
-        except Exception as e:
-            return f"❌ {e}"
-    safe = luna_safe_path(path)
-    if safe is None:
-        return "❌ Path not allowed (only Luna projects or data/)."
-    ok, result = luna_write_file(path, content)
-    return f"✅ {result}" if ok else f"❌ {result}"
-
-
-def _run_agent_create(scope: str | None, description: str) -> str:
-    """Shadow: create a small Python agent from description. Saves to data/agents/ and Luna projects/agents/; then asks for a name and registers it."""
-    if not (description or "").strip():
-        return "What should the agent do? Say e.g. Shadow, create an agent that fetches the weather."
-    desc = description.strip()[:1500]
-    agents_dir = os.path.join(_DATA_DIR, "agents")
-    luna_agents_dir = os.path.join(LUNA_PROJECTS_BASE, "agents") if isinstance(LUNA_PROJECTS_BASE, str) else str(LUNA_PROJECTS_BASE / "agents")
-    os.makedirs(agents_dir, exist_ok=True)
-    os.makedirs(luna_agents_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = re.sub(r"[^\w\-]", "_", desc[:40].strip()) or "agent"
-    filename = f"agent_{ts}_{safe_name}.py"
-    try:
-        prompt = f"""Create a single Python script that: {desc}
-
-Requirements:
-- One .py file, runnable with: python script.py
-- Use only standard library or common deps (requests, etc.). No Luna/bot imports.
-- Include a short docstring and if needed argparse for CLI.
-Output only the Python code, no markdown."""
-        code = ollama_chat(prompt, system_prompt="You are a Python developer. Output only valid Python code.", memory_scope=None, message_history=None, model=OLLAMA_MODEL)
-        code = code.strip()
-        if code.startswith("```"):
-            code = re.sub(r"^```\w*\n?", "", code)
-            code = re.sub(r"\n?```\s*$", "", code)
-        out_path_data = os.path.join(agents_dir, filename)
-        out_path_luna = os.path.join(luna_agents_dir, filename)
-        with open(out_path_data, "w", encoding="utf-8") as f:
-            f.write(code)
-        with open(out_path_luna, "w", encoding="utf-8") as f:
-            f.write(code)
-        if scope:
-            _pending_agent_name[scope] = {"filename": filename}
-            return f"✅ Agent created: **{filename}**. What name do you want for this agent? (You'll use it to run it later, e.g. **Shadow, run Hank**.) Reply with the name only, or **no** to skip naming."
-        return f"✅ Agent created: **{filename}** (in data/agents/ and Luna projects/agents/). Say that in chat and I'll ask for a name so you can run it with Shadow, run <name>."
-    except Exception as e:
-        return f"❌ Agent creation failed: {e}"
-
-
-def _register_agent_name(scope: str, name: str) -> str:
-    """If scope has a pending agent, register it under the given name. Returns reply message. Clears _pending_agent_name[scope]."""
-    pending = _pending_agent_name.pop(scope, None)
-    if not pending or not pending.get("filename"):
-        return ""
-    filename = pending["filename"]
-    # Sanitize name: alphanumeric, spaces, hyphen -> one word or words joined by underscore (e.g. Hank, George, Weather_Bot)
-    clean = re.sub(r"[^\w\s\-]", "", (name or "").strip()).strip() or "agent"
-    clean = clean.replace(" ", "_").replace("-", "_")[:64].strip("_") or "agent"
-    if len(clean) < 1 or len(clean) > 64:
-        _pending_agent_name[scope] = pending  # put back
-        return "Name must be 1–64 characters. Try again (e.g. Hank, George, Weather_Bot)."
-    registry = _load_agents_registry()
-    registry[clean] = filename
-    _save_agents_registry(registry)
-    return f"✅ Agent registered as **{clean}**. Say **Shadow, run {clean}** to run it."
-
-
-def _run_agent_by_name(name: str) -> str:
-    """Run a registered agent by name. Returns output or error string."""
-    name = (name or "").strip()
-    if not name:
-        return "Which agent? Say e.g. Shadow, run Hank."
-    registry = _load_agents_registry()
-    filename = registry.get(name)
-    if not filename:
-        names = ", ".join(sorted(registry.keys())[:10]) or "none"
-        return f"Unknown agent **{name}**. Registered agents: {names}."
-    agents_dir = os.path.join(_DATA_DIR, "agents")
-    path = os.path.join(agents_dir, filename)
-    if not os.path.isfile(path):
-        return f"Agent file missing: {filename}."
-    try:
-        result = subprocess.run(
-            [sys.executable, path],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            cwd=agents_dir,
-        )
-        out = (result.stdout or "").strip() or (result.stderr or "").strip()
-        if result.returncode != 0 and out:
-            return f"**{name}** (exit {result.returncode}):\n{out[:1500]}"
-        return f"**{name}**:\n{out[:2000]}" if out else f"✅ **{name}** ran (no output)."
-    except subprocess.TimeoutExpired:
-        return f"❌ **{name}** timed out after 60s."
-    except Exception as e:
-        return f"❌ **{name}**: {e}"
+    """If the user message is a natural-language request for a Luna command, return (command_key, params). Else return None. Uses heuristic parser only (no Ollama)."""
+    return _parse_natural_language_command_heuristic(msg)
 
 
 def _run_parsed_command(cmd: str, params: dict, scope: str | None = None) -> str:
-    """Execute a parsed command (from NL or internal) and return the reply text. scope needed for 'do' (pending action)."""
+    """Execute a parsed command (from NL or internal) and return the reply text."""
     cmd = (cmd or "").strip().lower()
     p = params or {}
-    if cmd == "optimize":
-        return _run_self_optimize(scope)
-    if cmd == "create_feature":
-        desc = (p.get("description") or p.get("query") or "").strip()
-        return _run_create_feature(scope, desc)
-    if cmd == "explain_error":
-        return _handle_why_mistake_llm()
-    if cmd == "do":
-        return _run_do_research_and_propose(scope, (p.get("description") or p.get("query") or "").strip())
-    if cmd == "agent_create":
-        desc = (p.get("description") or p.get("query") or "").strip()
-        return _run_agent_create(scope, desc)
-    if cmd == "run_agent":
-        name = (p.get("name") or p.get("agent") or "").strip()
-        return _run_agent_by_name(name)
     if cmd == "msg":
         contact = (p.get("contact") or "").strip()
         desc = (p.get("description") or "").strip() or None
@@ -6552,16 +6379,6 @@ def _run_parsed_command(cmd: str, params: dict, scope: str | None = None) -> str
         if not ok:
             return f"❌ {result}"
         return f"✅ {result}"
-    if cmd == "run":
-        path = (p.get("path") or "").strip().replace("\\", "/").lstrip("/")
-        if not path:
-            return "Which script? Give a path in Luna projects (e.g. script.py or tools/run.py)."
-        if not path.lower().endswith(".py"):
-            path = path.rstrip("/") + ".py" if not path.endswith(".py") else path
-        if not scope:
-            return "Say that in the chat and I'll ask you to confirm before running the script."
-        _pending_run[scope] = {"path": path}
-        return f"Run **{path}** in Luna projects? Reply **yes** to run it, or **no** to cancel."
     if cmd == "play":
         return "Use !play <song or url> in Discord when I'm in a voice channel to play music."
     if cmd == "suno":
@@ -6573,15 +6390,6 @@ def _run_parsed_command(cmd: str, params: dict, scope: str | None = None) -> str
             _record_automation_failure(cmd, result, p)
             return f"❌ {result}"
         return f"✅ {result}"
-    if cmd == "local_song":
-        desc = (p.get("description") or "").strip()
-        if not desc:
-            return "What kind of song? Give a short description."
-        ok, result = create_local_song_project(desc)
-        if not ok:
-            _record_automation_failure(cmd, result, p)
-            return f"❌ {result}"
-        return f"✅ Local song package created:\n{result}"
     if cmd == "share_x":
         ok, result = _run_x_share_random_song()
         if not ok:
@@ -6624,32 +6432,28 @@ def _run_parsed_command(cmd: str, params: dict, scope: str | None = None) -> str
             _record_automation_failure(cmd, result, p)
             return f"❌ {result}"
         return f"✅ {result}"
-    if cmd == "read":
-        path = (p.get("path") or "").strip()
-        if not path:
-            return "Which file? Say the path (e.g. read myfile.txt)."
-        ok, result = luna_read_file(path)
-        if ok:
-            return f"```\n{result}\n```" if len(result) <= 1900 else result[:1897] + "..."
-        _record_automation_failure(cmd, result, p)
-        return f"❌ {result}"
-    if cmd == "list":
-        path = (p.get("path") or "").strip()
-        ok, result = luna_list_dir(path)
-        if ok:
-            return f"Luna projects / {path or '.'}\n```\n{result}\n```"
-        _record_automation_failure(cmd, result, p)
-        return f"❌ {result}"
-    if cmd == "write":
-        path = (p.get("path") or "").strip()
-        content = (p.get("content") or "").strip()
-        if not path:
-            return "Which file? Say the path (e.g. write myfile.txt with content hello)."
-        ok, result = luna_write_file(path, content)
+    if cmd == "create_code":
+        req = (p.get("request") or "").strip()
+        req = re.sub(r"^(?:shadow[,:\s]+|luna[,:\s]+)", "", req, flags=re.IGNORECASE).strip() or req
+        if not req:
+            return "What should the script do? (e.g. Shadow, create a script that fetches the weather)"
+        ok, result = _run_create_agent_code(req, open_in_notepad=True)
         if not ok:
             _record_automation_failure(cmd, result, p)
             return f"❌ {result}"
         return f"✅ {result}"
+    if cmd == "remind":
+        time_raw = (p.get("time") or "").strip().replace(" ", "")
+        msg_part = (p.get("message") or "").strip()[:500]
+        if not msg_part:
+            return "What should I remind you to do? (e.g. remind me at 7pm to take my medicine)"
+        time_str = _parse_reminder_time(time_raw)
+        if not time_str:
+            return "I didn't get a valid time. Say something like 7pm, 7:00 pm, or 19:00."
+        if not LINKED_DISCORD_USER_ID:
+            return "Reminders need a linked Discord user (set LINKED_DISCORD_USER_ID in .env). I'll DM you at that time."
+        add_reminder(time_str, msg_part, LINKED_DISCORD_USER_ID, recurring=None)
+        return f"✅ I'll remind you at **{time_str}** to {msg_part}. You'll get a Discord DM with a voice note."
     if cmd == "files":
         return "Type **!help** to see my full command list."
     if cmd == "join":
@@ -6660,7 +6464,7 @@ def _run_parsed_command(cmd: str, params: dict, scope: str | None = None) -> str
 
 
 def _record_automation_failure(command_id: str, error_message: str, params: dict | None = None) -> None:
-    """Store last failed automation so the user can ask 'why did you make a mistake?' and 'retry and find the solution'."""
+    """Store last failed automation so the user can say 'retry' to analyze and retry with different strategies."""
     global _last_automation_command, _last_automation_error, _last_automation_params
     _last_automation_command = (command_id or "").strip() or None
     _last_automation_error = (error_message or "").strip() or None
@@ -6719,30 +6523,13 @@ def _should_prefer_longer_waits(command_id: str) -> bool:
     return len(_get_learned_solutions(command_id)) > 0
 
 
-def _is_why_mistake_request(msg: str) -> bool:
-    """True if the user is asking why Luna made a mistake or failed."""
-    if not (msg or msg.strip()):
-        return False
-    low = msg.strip().lower()
-    phrases = (
-        "why did you make a mistake",
-        "why did you fail",
-        "why did that fail",
-        "what went wrong",
-        "explain the error",
-        "why the error",
-        "what was the mistake",
-        "why did it fail",
-    )
-    return any(p in low for p in phrases)
-
-
 def _is_retry_solution_request(msg: str) -> bool:
-    """True if the user wants Luna to retry and find a solution."""
+    """True if the user wants Luna to analyze the situation and retry with different strategies."""
     if not (msg or msg.strip()):
         return False
     low = msg.strip().lower()
     phrases = (
+        "retry",
         "retry and find the solution",
         "retry with a solution",
         "find the solution and retry",
@@ -6756,45 +6543,33 @@ def _is_retry_solution_request(msg: str) -> bool:
     return any(p in low for p in phrases)
 
 
-def _handle_why_mistake() -> str:
-    """Return the last automation error (no LLM explanation). Used when Luna path asks."""
-    if not _last_automation_error:
-        return "I don't have a recent mistake to explain. If something failed, try the action again and then ask me why it failed."
-    cmd = _last_automation_command or "that action"
-    return f"**Last action:** {cmd}\n\n**What went wrong:** {_last_automation_error}"
-
-
-def _handle_why_mistake_llm() -> str:
-    """Shadow: use Ollama to explain why the last automation failed. One short paragraph."""
-    if not _last_automation_error:
-        return "No recent failure to explain. Run an action first; if it fails, say **Shadow, explain last error**."
-    cmd = _last_automation_command or "the action"
-    prompt = f"The user ran a command that failed.\n\nCommand: {cmd}\nRaw error: {_last_automation_error}\n\nIn 2–4 sentences, explain in plain language why it likely failed and what to try (e.g. check login, retry, different input). No code. Reply only with the explanation."
-    try:
-        out = ollama_chat(prompt, system_prompt="You are a concise technical assistant. Explain errors clearly.", memory_scope=None, message_history=None, model=OLLAMA_MODEL_SMALL)
-        return f"**Last action:** {cmd}\n\n**What went wrong:** {_last_automation_error}\n\n**Explanation:** {out.strip()}"
-    except Exception as e:
-        return f"**Last action:** {cmd}\n\n**What went wrong:** {_last_automation_error}\n\n(Could not generate explanation: {e})"
-
-
 def _handle_retry_solution() -> str:
-    """Retry the last failed automation once; the automation tries several strategies in one run (single browser session)."""
+    """Analyze the situation and retry the last failed command with different strategies (longer waits, alternate selectors). Tries up to two attempts so Luna can find what works."""
     if not _last_automation_command or not _last_automation_error:
-        return "I don't have a recent failure to retry. Run an action first; if it fails, then say **retry and find the solution**."
+        return "I don't have a recent failure to retry. Run an action first; if it fails, say **retry** and I'll try again with different strategies."
     cmd = _last_automation_command
     params = _last_automation_params
+    # First attempt: re-run the command (automation code uses multiple strategies in one run)
     retry_reply = _run_parsed_command(cmd, params)
     if (retry_reply or "").strip().startswith("✅"):
         _save_automation_solution(cmd, _last_automation_error)
-    return f"**Retrying once** (several strategies in the same run, single browser open):\n\n{retry_reply}"
+        return f"**Retry (different strategies):**\n\n{retry_reply}"
+    # Second attempt: save that we're retrying so next run prefers longer waits / alternate paths, then try once more
+    _save_automation_solution(cmd, _last_automation_error)
+    retry_reply2 = _run_parsed_command(cmd, params)
+    if (retry_reply2 or "").strip().startswith("✅"):
+        return f"**First attempt didn't complete; second attempt (longer waits / alternate strategy):**\n\n{retry_reply2}"
+    return f"**Analyzed and retried twice** with different strategies; still didn't complete:\n\n{retry_reply2}"
 
 
 def _is_nl_command_allowed_on_discord(cmd: str, author_id: int) -> bool:
     """True if this Discord user can run this command (admin/linked where required)."""
     if cmd in ("msg", "call"):
         return _can_use_whatsapp_discord(author_id)
-    if cmd == "suno":
+    if cmd in ("suno", "create_code"):
         return _can_use_suno_discord(author_id)
+    if cmd == "remind":
+        return _linked_discord_id_int is not None and author_id == _linked_discord_id_int
     if cmd in ("share_x", "share_facebook"):
         return _can_use_x_share_discord(author_id)
     if cmd == "yt_comment":
@@ -6803,39 +6578,12 @@ def _is_nl_command_allowed_on_discord(cmd: str, author_id: int) -> bool:
         return _can_use_instagram_dm_discord(author_id)
     if cmd == "fb_msg":
         return _can_use_messenger_discord(author_id)
-    if cmd in ("read", "list", "write", "edit", "run", "optimize", "create_feature", "do", "agent_create", "run_agent"):
-        return _discord_admin_id_int is not None and author_id == _discord_admin_id_int
-    if cmd == "explain_error":
-        return True  # anyone can ask Shadow to explain last error
     return True
 
 
 def _get_command_intent_reply(msg: str) -> str | None:
     """Receptionist: command list only via explicit !help / !files / !commands (handled elsewhere). Never from natural language."""
     return None
-
-
-def _pending_write_entries(pending: dict | None) -> list[dict]:
-    """Backward-compatible read for pending single-write or multi-write payloads."""
-    if not isinstance(pending, dict):
-        return []
-    entries = pending.get("writes")
-    if isinstance(entries, list):
-        out = []
-        for e in entries:
-            if not isinstance(e, dict):
-                continue
-            p = (e.get("path") or "").strip()
-            c = e.get("content") or ""
-            if p:
-                out.append({"path": p, "content": c})
-        if out:
-            return out
-    # Legacy shape: {"path": "...", "content": "..."}
-    p = (pending.get("path") or "").strip()
-    if p:
-        return [{"path": p, "content": pending.get("content") or ""}]
-    return []
 
 
 def _handle_web_file_command(msg: str) -> str | None:
@@ -6846,41 +6594,8 @@ def _handle_web_file_command(msg: str) -> str | None:
     parts = msg.split(None, 1)
     cmd = (parts[0] or "").lower()
     args = (parts[1] or "").strip()
-    if cmd == "!read":
-        if not args:
-            return "Usage: !read <path> (e.g. !read snippet.html)"
-        ok, result = luna_read_file(args)
-        if ok:
-            return f"```\n{result}\n```" if len(result) <= 1900 else result[:1897] + "..."
-        return f"❌ {result}"
-    if cmd == "!write":
-        if " " not in args:
-            return "Usage: !write <path> <content> (e.g. !write test.txt Hello world)"
-        path, content = args.split(None, 1)
-        ok, result = luna_write_file(path, content)
-        return f"✅ {result}" if ok else f"❌ {result}"
-    if cmd == "!list":
-        path = args  # can be empty
-        ok, result = luna_list_dir(path)
-        if ok:
-            return f"Luna projects / {path or '.'}\n```\n{result}\n```"
-        return f"❌ {result}"
-    if cmd == "!edit":
-        if " -> " not in args:
-            return "Usage: !edit <path> <old_text> -> <new_text>"
-        path_and_old, new_text = args.split(" -> ", 1)
-        parts_edit = path_and_old.strip().split(None, 1)
-        path = parts_edit[0] if parts_edit else ""
-        old_text = parts_edit[1] if len(parts_edit) > 1 else ""
-        new_text = new_text.strip()
-        if not path:
-            return "Usage: !edit <path> <old_text> -> <new_text>"
-        ok, result = luna_modify_file(path, old_text, new_text)
-        return f"✅ {result}" if ok else f"❌ {result}"
     if cmd in ("!help", "!files", "!commands"):
         return LUNA_COMMANDS_REPLY
-    if cmd == "!optimize":
-        return _run_self_optimize(LINKED_SCOPE or "web")
     if cmd == "!news":
         ok, result = employee_newsroom()
         return result if ok else f"❌ {result}"
@@ -6894,17 +6609,6 @@ def _handle_web_file_command(msg: str) -> str | None:
             return "Usage: !suno <song description>"
         ok, result = _run_suno_create(args)
         return f"✅ {result}" if ok else f"❌ {result}"
-    if cmd in ("!local_song", "!local-song"):
-        if not args:
-            return "Usage: !local_song <song description>"
-        ok, result = create_local_song_project(args)
-        return f"✅ Local song package created:\n{result}" if ok else f"❌ {result}"
-    if cmd == "!local" and args.lower().startswith("song"):
-        prompt = args[4:].strip()
-        if not prompt:
-            return "Usage: !local song <song description>"
-        ok, result = create_local_song_project(prompt)
-        return f"✅ Local song package created:\n{result}" if ok else f"❌ {result}"
     if cmd in ("!share_song", "!share-song", "!xshare"):
         ok, result = _run_x_share_random_song()
         if not ok:
@@ -7032,60 +6736,6 @@ def api_chat():
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
     # Confirmation: user said yes -> run pending script, execute pending "do" action, or pending write
-    if _is_confirm_message(msg) and scope and scope in _pending_run:
-        pending = _pending_run.pop(scope, None)
-        if pending and pending.get("path"):
-            ok, output = _run_script_in_luna_projects(pending["path"])
-            reply = f"✅ **Output:**\n```\n{output[:1900]}{'…' if len(output) > 1900 else ''}\n```" if ok else f"❌ {output}"
-        else:
-            reply = "Nothing to run."
-        append_exchange(scope, msg, reply)
-        _play_reply_tts_on_pc(reply)
-        return jsonify({"reply": reply})
-    if _is_confirm_message(msg) and scope and scope in _pending_do_action:
-        reply = _execute_pending_do_action(scope)
-        append_exchange(scope, msg, reply)
-        _play_reply_tts_on_pc(reply)
-        return jsonify({"reply": reply})
-    # Pending agent name: user just created an agent; this message is the name (or no/cancel)
-    if scope and scope in _pending_agent_name:
-        msg_lower = (msg or "").strip().lower()
-        if msg_lower in ("no", "cancel"):
-            _pending_agent_name.pop(scope, None)
-            reply = "Cancelled. Agent is saved but not registered; you can run it by filename from data/agents/."
-        else:
-            reply = _register_agent_name(scope, msg)
-        append_exchange(scope, msg, reply)
-        _play_reply_tts_on_pc(reply)
-        return jsonify({"reply": reply})
-    pending_scope = scope if scope in _pending_writes else _pending_write_scope_for_web()
-    if _is_confirm_message(msg) and pending_scope is not None:
-        pending = _pending_writes.pop(pending_scope)
-        entries = _pending_write_entries(pending)
-        created_paths = []
-        errors = []
-        for e in entries:
-            ok, result = luna_write_file(e["path"], e["content"])
-            if ok:
-                created_paths.append(result)
-                print(f"[Luna] File written to: {result}", flush=True)
-                _open_file_by_path(result)
-            else:
-                errors.append(f"{e['path']}: {result}")
-        if created_paths and not errors:
-            if len(created_paths) == 1:
-                reply = f"✅ File created at:\n{created_paths[0]}\n(Opened in your default editor.)"
-            else:
-                preview = "\n".join(created_paths[:6])
-                more = f"\n...and {len(created_paths) - 6} more." if len(created_paths) > 6 else ""
-                reply = f"✅ Created {len(created_paths)} files:\n{preview}{more}\n(Opened in your default editor.)"
-        elif created_paths and errors:
-            reply = f"⚠️ Created {len(created_paths)} file(s), but some failed:\n" + "\n".join(errors[:6])
-        else:
-            reply = "❌ Could not create files:\n" + ("\n".join(errors[:6]) if errors else "No valid file payload found.")
-        append_exchange(pending_scope, msg, reply)
-        _play_reply_tts_on_pc(reply)
-        return jsonify({"reply": reply})
     # Shadow: "Shadow, do X" -> run command only, no Luna LLM (lighter + faster)
     rest = strip_shadow_prefix(msg)
     if rest is not None:
@@ -7093,53 +6743,11 @@ def api_chat():
         append_exchange(scope, msg, reply)
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
-    msg_lower = (msg or "").strip().lower()
-    if msg_lower.startswith("!run"):
-        path = msg.strip()[4:].strip().replace("\\", "/").lstrip("/")
-        if not path:
-            reply = "Usage: !run <path> (e.g. !run script.py) — path relative to Luna projects. Reply **yes** to run."
-        else:
-            if not path.lower().endswith(".py"):
-                path = path.rstrip("/") + ".py"
-            _pending_run[scope] = {"path": path}
-            reply = f"Run **{path}** in Luna projects? Reply **yes** to run it, or **no** to cancel."
-        append_exchange(scope, msg, reply)
-        _play_reply_tts_on_pc(reply)
-        return jsonify({"reply": reply})
-    if msg_lower in ("no", "cancel"):
-        if scope and scope in _pending_run:
-            _pending_run.pop(scope, None)
-            reply = "Cancelled."
-            append_exchange(scope, msg, reply)
-            return jsonify({"reply": reply})
-        if scope and scope in _pending_do_action:
-            _pending_do_action.pop(scope, None)
-            reply = "Cancelled."
-            append_exchange(scope, msg, reply)
-            return jsonify({"reply": reply})
-        if scope and scope in _pending_agent_name:
-            _pending_agent_name.pop(scope, None)
-            reply = "Cancelled. Agent is saved but not registered; you can run it by filename from data/agents/."
-            append_exchange(scope, msg, reply)
-            return jsonify({"reply": reply})
-        if scope in _pending_writes or _pending_write_scope_for_web() is not None:
-            pop_scope = scope if scope in _pending_writes else _pending_write_scope_for_web()
-            if pop_scope:
-                _pending_writes.pop(pop_scope, None)
-            reply = "Cancelled."
-            append_exchange(scope, msg, reply)
-            return jsonify({"reply": reply})
     # Explicit ! commands in browser always execute directly.
     file_reply = _handle_web_file_command(msg)
     if file_reply is not None:
         append_exchange(scope, msg, file_reply)
         return jsonify({"reply": file_reply})
-    # OpenClaw-style: "why did you make a mistake?" / "retry and find the solution"
-    if _is_why_mistake_request(msg):
-        reply = _handle_why_mistake()
-        append_exchange(scope, msg, reply)
-        _play_reply_tts_on_pc(reply)
-        return jsonify({"reply": reply})
     if _is_retry_solution_request(msg):
         reply = _handle_retry_solution()
         append_exchange(scope, msg, reply)
@@ -7182,16 +6790,6 @@ def api_chat():
         append_exchange(scope, msg, reply)
         _play_reply_tts_on_pc(reply)
         return jsonify({"reply": reply})
-    # Local song/lyrics generation (fully local files, no Suno)
-    local_desc = _extract_local_song_description(msg) if tool_intent else ""
-    if tool_intent and local_desc:
-        announce = f"Generating local song and lyrics package for: {_suno_preview_text(local_desc)}"
-        _play_reply_tts_on_pc(announce)
-        ok, result = create_local_song_project(local_desc)
-        reply = f"✅ Local song package created:\n{result}" if ok else f"❌ {result}"
-        append_exchange(scope, msg, reply)
-        _play_reply_tts_on_pc(reply)
-        return jsonify({"reply": reply})
     # Suno song creation from web UI (direct command or conversational phrase)
     suno_desc = _extract_suno_description(msg) if tool_intent else ""
     if tool_intent and suno_desc:
@@ -7228,72 +6826,37 @@ def api_chat():
         _try_capture_profile(scope, msg)
         _play_reply_tts_on_pc(command_reply)
         return jsonify({"reply": command_reply})
-    # Boss: get conversation history; if long, Scribe summarizes the older part (compaction).
-    history = get_recent_conversation(scope, 40)
-    history = _compact_conversation_history(history)
-    last_assistant = ""
-    for h in reversed(history):
-        if (h.get("role") or "").lower() == "assistant":
-            last_assistant = (h.get("content") or "").strip()
-            break
-    try_capture_profile_from_reply(scope, last_assistant, msg)
-
-    def _post_process_reply(reply: str) -> str:
-        """Apply markers, LUNA_WRITE_FILE parsing, and pending writes. Returns final display text."""
-        for marker, key in (("LUNA_RECORD_SOUL", "SOUL"), ("LUNA_RECORD_TOOLS", "TOOLS"), ("LUNA_RECORD_OBJECTIVES", "OBJECTIVES")):
-            if marker in reply:
-                _pending_file_update[scope] = key
-                reply = re.sub(r"\s*" + re.escape(marker) + r"\s*", "\n", reply).strip()
-                break
-        cleaned, writes = _parse_luna_writes(reply)
-        if not writes and _user_wants_file_creation(msg):
-            writes = _extract_code_blocks_from_reply(reply)
-        if not writes and _user_wants_file_creation(msg) and cleaned and len(cleaned.strip()) > 20:
-            path = _relatable_note_filename(msg, cleaned)
-            writes = [{"path": _normalize_luna_path(path), "content": cleaned.strip()}]
-        if writes:
-            _pending_writes[scope] = {"writes": writes}
-            count = len(writes)
-            noun = "file" if count == 1 else "files"
-            return cleaned + f"\n\nReply **yes** to create {count} {noun} in Luna projects, or **no** to cancel."
-        return cleaned
-
-    if stream_response:
-        def _stream_gen():
-            full = []
-            try:
-                # Boss (Luna) streams reply via OLLAMA_MODEL.
-                for delta in ollama_chat_stream(msg, LUNA_SYSTEM_PROMPT, scope, history):
-                    full.append(delta)
-                    yield f"data: {json.dumps({'chunk': delta}, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                full.append(str(e))
-            reply = "".join(full).strip() or "I didn't get a reply."
-            final_display = _post_process_reply(reply)
-            append_exchange(scope, msg, final_display)
-            _try_capture_memory(scope, msg)
-            _try_capture_profile(scope, msg)
-            threading.Thread(target=_maybe_update_user_style, args=(scope,), daemon=True).start()
-            _play_reply_tts_on_pc(final_display)
-            yield f"data: {json.dumps({'done': True, 'final': final_display}, ensure_ascii=False)}\n\n"
-        return Response(
-            stream_with_context(_stream_gen()),
-            mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            },
-        )
-
-    # Boss (Luna) replies: main chat using OLLAMA_MODEL.
-    reply = ollama_chat(msg, LUNA_SYSTEM_PROMPT, scope, history)
-    reply = _post_process_reply(reply)
+    # Luna mode (chat): use OLLAMA_CHAT_MODEL (e.g. Llama 3.2) for normal conversation. Shadow stays Qwen for commands.
+    history = get_recent_conversation(scope, 15)
+    try:
+        if stream_response:
+            chunks = []
+            for chunk in ollama_chat_stream(
+                msg, system_prompt=LUNA_SYSTEM_PROMPT, memory_scope=scope, message_history=history, model=OLLAMA_CHAT_MODEL
+            ):
+                chunks.append(chunk)
+            reply = "".join(chunks).strip() if chunks else ""
+        else:
+            reply = ollama_chat(
+                msg, system_prompt=LUNA_SYSTEM_PROMPT, memory_scope=scope, message_history=history, model=OLLAMA_CHAT_MODEL
+            )
+        if not reply or reply.startswith("Ollama isn't responding") or reply.startswith("Something went wrong"):
+            reply = COMMAND_ONLY_REPLY
+    except Exception:
+        reply = COMMAND_ONLY_REPLY
     append_exchange(scope, msg, reply)
     _try_capture_memory(scope, msg)
     _try_capture_profile(scope, msg)
-    threading.Thread(target=_maybe_update_user_style, args=(scope,), daemon=True).start()
     _play_reply_tts_on_pc(reply)
+    if stream_response:
+        def _stream_gen():
+            yield f"data: {json.dumps({'chunk': reply}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True, 'final': reply}, ensure_ascii=False)}\n\n"
+        return Response(
+            stream_with_context(_stream_gen()),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        )
     return jsonify({"reply": reply})
 
 
@@ -7463,6 +7026,7 @@ async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.listening, name=f"{OLLAMA_MODEL}")
     )
+    bot.loop.create_task(_reminder_loop())
 
 
 def _parse_play_choice(user_message: str, results: list[dict]) -> int | None:
@@ -7636,7 +7200,7 @@ async def on_message(message: discord.Message):
             text = text.replace(f"<@{bot.user.id}>", "").strip()
         mention = f"<@{message.author.id}>"
         if not text:
-            await message.reply(f"Hey {mention}! I'm **Luna**. Say something and I'll answer with my AI brain ({OLLAMA_MODEL}).")
+            await message.reply(f"Hey {mention}! I'm **Luna** — chat with me normally, or say **Shadow, <command>** for actions. **!help** for the list.")
             return
         # Linked user (Chris/Solonaras) shares one scope with web; others get per-server or per-DM scope
         memory_scope = _scope_for_discord_user(message.author.id, message.guild.id if message.guild else None)
@@ -7656,96 +7220,6 @@ async def on_message(message: discord.Message):
                 reply = f"Saved to **{name}**. I'll use that from now on."
             except Exception as e:
                 reply = f"Couldn't save to {key}: {e}"
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
-        # Pending run script: user said yes -> run .py in Luna projects
-        is_confirm = _is_confirm_message(text)
-        if is_confirm and memory_scope in _pending_run:
-            pending = _pending_run.pop(memory_scope, None)
-            if pending and pending.get("path"):
-                ok, output = await asyncio.to_thread(_run_script_in_luna_projects, pending["path"])
-                reply = f"✅ **Output:**\n```\n{output[:1900]}{'…' if len(output) > 1900 else ''}\n```" if ok else f"❌ {output}"
-            else:
-                reply = "Nothing to run."
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
-        if is_confirm and memory_scope in _pending_do_action:
-            reply = await asyncio.to_thread(_execute_pending_do_action, memory_scope)
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
-        if memory_scope in _pending_agent_name:
-            text_lower = (text or "").strip().lower()
-            if text_lower in ("no", "cancel"):
-                _pending_agent_name.pop(memory_scope, None)
-                reply = "Cancelled. Agent is saved but not registered; you can run it by filename from data/agents/."
-            else:
-                reply = await asyncio.to_thread(_register_agent_name, memory_scope, text)
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
-        # Pending file creation: only admin can confirm on Discord; then we write and open file
-        if is_confirm and memory_scope in _pending_writes:
-            if is_discord_admin and _discord_admin_id_int is not None:
-                pending = _pending_writes.pop(memory_scope)
-                entries = _pending_write_entries(pending)
-                created_paths = []
-                errors = []
-                for e in entries:
-                    ok, result = await asyncio.to_thread(luna_write_file, e["path"], e["content"])
-                    if ok:
-                        created_paths.append(result)
-                        print(f"[Luna] File written to: {result}", flush=True)
-                        await asyncio.to_thread(_open_file_by_path, result)
-                    else:
-                        errors.append(f"{e['path']}: {result}")
-                if created_paths and not errors:
-                    if len(created_paths) == 1:
-                        reply = f"✅ File created at:\n{created_paths[0]}\n(Opened in your default editor.)"
-                    else:
-                        preview = "\n".join(created_paths[:6])
-                        more = f"\n...and {len(created_paths) - 6} more." if len(created_paths) > 6 else ""
-                        reply = f"✅ Created {len(created_paths)} files:\n{preview}{more}\n(Opened in your default editor.)"
-                elif created_paths and errors:
-                    reply = f"⚠️ Created {len(created_paths)} file(s), but some failed:\n" + "\n".join(errors[:6])
-                else:
-                    reply = "❌ Could not create files:\n" + ("\n".join(errors[:6]) if errors else "No valid file payload found.")
-            else:
-                _pending_writes.pop(memory_scope, None)
-                reply = "Only the server admin can create files in Luna projects."
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
-        if text_lower in ("no", "cancel"):
-            if memory_scope in _pending_run:
-                _pending_run.pop(memory_scope, None)
-                reply = "Cancelled."
-                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-                await message.reply(f"{mention} {reply}")
-                return
-            if memory_scope in _pending_do_action:
-                _pending_do_action.pop(memory_scope, None)
-                reply = "Cancelled."
-                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-                await message.reply(f"{mention} {reply}")
-                return
-            if memory_scope in _pending_agent_name:
-                _pending_agent_name.pop(memory_scope, None)
-                reply = "Cancelled. Agent is saved but not registered."
-                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-                await message.reply(f"{mention} {reply}")
-                return
-            if memory_scope in _pending_writes:
-                _pending_writes.pop(memory_scope, None)
-                reply = "Cancelled."
-                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-                await message.reply(f"{mention} {reply}")
-                return
-        # OpenClaw-style: "why did you make a mistake?" / "retry and find the solution"
-        if _is_why_mistake_request(text):
-            reply = await asyncio.to_thread(_handle_why_mistake)
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
@@ -7827,31 +7301,6 @@ async def on_message(message: discord.Message):
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
-        if text.strip().lower().startswith("!optimize"):
-            if not is_discord_admin:
-                reply = "Only the server admin can run self-optimization."
-            else:
-                reply = await asyncio.to_thread(_run_self_optimize, memory_scope)
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
-        if text.strip().lower().startswith("!run"):
-            if not is_discord_admin:
-                reply = "Only the server admin can run scripts in Luna projects."
-                await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-                await message.reply(f"{mention} {reply}")
-                return
-            path = text.strip()[4:].strip().replace("\\", "/").lstrip("/")
-            if not path:
-                reply = "Usage: `!run <path>` (e.g. !run script.py) — path relative to Luna projects. Reply **yes** to run."
-            else:
-                if not path.lower().endswith(".py"):
-                    path = path.rstrip("/") + ".py"
-                _pending_run[memory_scope] = {"path": path}
-                reply = f"Run **{path}** in Luna projects? Reply **yes** to run it, or **no** to cancel."
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
         tool_intent = await asyncio.to_thread(_intent_requires_tool_call, text)
         ig_username, ig_custom_msg = _extract_instagram_dm_request(text) if tool_intent else ("", "")
         if tool_intent and ig_username:
@@ -7873,15 +7322,6 @@ async def on_message(message: discord.Message):
                 await message.reply(f"{mention} Transcribing this YouTube video and posting a comment now...")
                 ok, result = await asyncio.to_thread(_run_youtube_comment, yt_comment_url)
                 reply = f"✅ {result}" if ok else f"❌ {result}"
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            await message.reply(f"{mention} {reply}")
-            return
-        # Local song/lyrics generation from Discord
-        local_desc = _extract_local_song_description(text) if tool_intent else ""
-        if tool_intent and local_desc:
-            await message.reply(f"{mention} Generating local song package for: {_suno_preview_text(local_desc)}")
-            ok, result = await asyncio.to_thread(create_local_song_project, local_desc)
-            reply = f"✅ Local song package created:\n{result}" if ok else f"❌ {result}"
             await asyncio.to_thread(append_exchange, memory_scope, text, reply)
             await message.reply(f"{mention} {reply}")
             return
@@ -7926,57 +7366,25 @@ async def on_message(message: discord.Message):
             await asyncio.to_thread(append_exchange, memory_scope, text, command_reply)
             await message.reply(f"{mention} {command_reply}")
             return
-        # If Luna's last message was a profile question, treat this reply as the answer
-        await asyncio.to_thread(try_capture_profile_from_reply, memory_scope, _last_assistant_by_scope.get(memory_scope, ""), text)
-        # Boss: get history; Scribe summarizes older part if long.
-        history = await asyncio.to_thread(get_recent_conversation, memory_scope, 40)
-        history = await asyncio.to_thread(_compact_conversation_history, history)
+        # Luna mode (chat): use OLLAMA_CHAT_MODEL (e.g. Llama 3.2) for normal conversation.
+        history = await asyncio.to_thread(get_recent_conversation, memory_scope, 15)
         try:
-            async with message.channel.typing():
-                # Boss (Luna) replies: main chat using OLLAMA_MODEL.
-                reply = await asyncio.to_thread(ollama_chat, text, LUNA_SYSTEM_PROMPT, memory_scope, history)
-            # If Luna asked to record the next message to SOUL/TOOLS/OBJECTIVES, set pending and strip the marker
-            for marker, key in (("LUNA_RECORD_SOUL", "SOUL"), ("LUNA_RECORD_TOOLS", "TOOLS"), ("LUNA_RECORD_OBJECTIVES", "OBJECTIVES")):
-                if marker in reply:
-                    _pending_file_update[memory_scope] = key
-                    reply = re.sub(r"\s*" + re.escape(marker) + r"\s*", "\n", reply).strip()
-                    break
-            cleaned, writes = _parse_luna_writes(reply)
-            if not writes and _user_wants_file_creation(text):
-                writes = _extract_code_blocks_from_reply(reply)
-            if not writes and _user_wants_file_creation(text) and cleaned and len(cleaned.strip()) > 20:
-                path = _relatable_note_filename(text, cleaned)
-                writes = [{"path": _normalize_luna_path(path), "content": cleaned.strip()}]
-            if writes:
-                if is_discord_admin and _discord_admin_id_int is not None:
-                    _pending_writes[memory_scope] = {"writes": writes}
-                    count = len(writes)
-                    noun = "file" if count == 1 else "files"
-                    reply = cleaned + f"\n\nReply **yes** to create {count} {noun} in Luna projects, or **no** to cancel."
-                else:
-                    reply = cleaned + "\n\nOnly the server admin can create files in Luna projects."
-            else:
-                reply = cleaned
-            await asyncio.to_thread(append_exchange, memory_scope, text, reply)
-            _last_assistant_by_scope[memory_scope] = reply
-            await asyncio.to_thread(_try_capture_memory, memory_scope, text)
-            await asyncio.to_thread(_try_capture_profile, memory_scope, text)
-            if len(reply) > 1900:
-                reply = reply[:1897] + "..."
-            await message.reply(f"{mention} {reply}")
-            # If Luna is in a voice channel in this guild, speak the reply. For configured TTS channels (e.g. Good Vibes general), auto-join voice if not in one.
-            if message.guild:
-                vc = next((c for c in bot.voice_clients if c.guild == message.guild and c.is_connected()), None)
-                if not vc and message.channel.id in _discord_tts_channel_ids:
-                    vc = await _auto_join_voice_for_guild(message.guild)
-                    if vc:
-                        print(f"[Luna] Auto-joined {vc.channel.name} (TTS channel {message.channel.id})", flush=True)
-                if vc and not vc.is_playing():
-                    await _ensure_voice_and_speak(message.guild, reply)
-        except discord.HTTPException as e:
-            print(f"Failed to reply: {e}")
-        except Exception as e:
-            await message.reply(f"{mention} Error: {e}")
+            reply = await asyncio.to_thread(
+                ollama_chat,
+                text,
+                system_prompt=LUNA_SYSTEM_PROMPT,
+                memory_scope=memory_scope,
+                message_history=history,
+                model=OLLAMA_CHAT_MODEL,
+            )
+            if not reply or reply.startswith("Ollama isn't responding") or reply.startswith("Something went wrong"):
+                reply = COMMAND_ONLY_REPLY
+        except Exception:
+            reply = COMMAND_ONLY_REPLY
+        await asyncio.to_thread(append_exchange, memory_scope, text, reply)
+        await asyncio.to_thread(_try_capture_memory, memory_scope, text)
+        await asyncio.to_thread(_try_capture_profile, memory_scope, text)
+        await message.reply(f"{mention} {reply}")
 
     await bot.process_commands(message)
 
@@ -7993,76 +7401,6 @@ def _scope_for_discord_user(author_id: int, guild_id: int | None) -> str:
     if author_id in _discord_dm_sync_ids_int:
         return f"discord:user:{author_id}"
     return f"discord:{guild_id}:{author_id}" if guild_id else f"discord:dm:{author_id}"
-
-
-@bot.command(name="read")
-async def cmd_read(ctx: commands.Context, *, path: str):
-    """Read a file from Luna projects. Example: !read snippet.html (admin only)"""
-    if not _is_discord_file_admin(ctx):
-        await ctx.reply("Only the server admin can use file commands.")
-        return
-    path = path.strip()
-    ok, result = await asyncio.to_thread(luna_read_file, path)
-    if ok:
-        if len(result) > 1900:
-            result = result[:1897] + "..."
-        await ctx.reply(f"```\n{result}\n```")
-    else:
-        await ctx.reply(f"❌ {result}")
-
-
-@bot.command(name="write")
-async def cmd_write(ctx: commands.Context, *, args: str):
-    """Write content to a file in Luna projects. Example: !write test.txt Hello world (admin only)"""
-    if not _is_discord_file_admin(ctx):
-        await ctx.reply("Only the server admin can use file commands.")
-        return
-    if " " not in args:
-        await ctx.reply("Usage: `!write <path> <content>` (path is relative to Luna projects)")
-        return
-    path, content = args.strip().split(None, 1)
-    ok, result = await asyncio.to_thread(luna_write_file, path, content)
-    if ok:
-        await ctx.reply(f"✅ {result}")
-    else:
-        await ctx.reply(f"❌ {result}")
-
-
-@bot.command(name="list")
-async def cmd_list(ctx: commands.Context, path: str = ""):
-    """List files in Luna projects. Example: !list or !list subfolder (admin only)"""
-    if not _is_discord_file_admin(ctx):
-        await ctx.reply("Only the server admin can use file commands.")
-        return
-    ok, result = await asyncio.to_thread(luna_list_dir, path)
-    if ok:
-        await ctx.reply(f"Luna projects / {path or '.'}\n```\n{result}\n```")
-    else:
-        await ctx.reply(f"❌ {result}")
-
-
-@bot.command(name="edit")
-async def cmd_edit(ctx: commands.Context, *, args: str):
-    """Replace old with new in a file. Example: !edit snippet.html old text -> new text (admin only)"""
-    if not _is_discord_file_admin(ctx):
-        await ctx.reply("Only the server admin can use file commands.")
-        return
-    if " -> " not in args:
-        await ctx.reply("Usage: `!edit <path> <old_text> -> <new_text>` (path relative to Luna projects)")
-        return
-    path_and_old, new_text = args.strip().split(" -> ", 1)
-    parts = path_and_old.strip().split(None, 1)
-    path = parts[0] if parts else ""
-    old_text = parts[1] if len(parts) > 1 else ""
-    new_text = new_text.strip()
-    if not path:
-        await ctx.reply("Usage: `!edit <path> <old_text> -> <new_text>`")
-        return
-    ok, result = await asyncio.to_thread(luna_modify_file, path, old_text, new_text)
-    if ok:
-        await ctx.reply(f"✅ {result}")
-    else:
-        await ctx.reply(f"❌ {result}")
 
 
 @bot.command(name="files")
@@ -8097,18 +7435,6 @@ async def cmd_suno(ctx: commands.Context, *, description: str = ""):
     await ctx.reply("Opening Suno and creating your song...")
     ok, result = await asyncio.to_thread(_run_suno_create, prompt)
     await ctx.reply(f"{'✅' if ok else '❌'} {result}")
-
-
-@bot.command(name="local_song")
-async def cmd_local_song(ctx: commands.Context, *, description: str = ""):
-    """Generate local instrumental + lyrics package in Luna projects/music_local."""
-    prompt = (description or "").strip()
-    if not prompt:
-        await ctx.reply("Usage: `!local_song <song description>`")
-        return
-    await ctx.reply("Generating local song package...")
-    ok, result = await asyncio.to_thread(create_local_song_project, prompt)
-    await ctx.reply(f"{'✅ Local song package created:' if ok else '❌'}\n{result}")
 
 
 @bot.command(name="share_song")
@@ -8596,24 +7922,6 @@ async def cmd_whatsapp_msg(ctx: commands.Context, *, args: str = ""):
     await ctx.reply(result if ok else f"❌ {result}")
 
 
-def _run_scheduled_x_share():
-    """Called by George (Shadow's scheduler): post a random channel song to X."""
-    try:
-        ok, result = _run_x_share_random_song()
-        print(f"[George] X share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
-    except Exception as e:
-        print(f"[George] X share error: {e}", flush=True)
-
-
-def _run_scheduled_facebook_share():
-    """Called by George (Shadow's scheduler): post a random channel song to Facebook."""
-    try:
-        ok, result = _run_facebook_share_random_song()
-        print(f"[George] Facebook share: {'OK' if ok else 'FAIL'} — {result[:120]}", flush=True)
-    except Exception as e:
-        print(f"[George] Facebook share error: {e}", flush=True)
-
-
 def _warmup_ollama():
     """Send a minimal request to Ollama after a short delay so the model stays loaded; first user reply is faster."""
     time.sleep(5)
@@ -8637,8 +7945,8 @@ def _warmup_ollama():
 
 
 def _start_share_scheduler():
-    """Start George (Shadow's sub-agent): scheduled X and Facebook shares at separate times (10:00 & 18:00 X, 11:00 & 19:00 Facebook)."""
-    george.start_george(_run_scheduled_x_share, _run_scheduled_facebook_share)
+    """No-op: scheduled X/Facebook shares (George) removed."""
+    pass
 
 
 def main():

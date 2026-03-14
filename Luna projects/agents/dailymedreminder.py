@@ -1,25 +1,63 @@
+"""
+Daily medicine reminder: adds a recurring 7pm reminder to Luna's reminder store.
+Run this once (e.g. python dailymedreminder.py from project root) to register.
+Luna will then DM you at 19:00 every day with a text + voice note: "Hey, remember you need to take your medicine."
+Requires LINKED_DISCORD_USER_ID in .env (or set in environment).
+"""
+from __future__ import annotations
+
+import json
 import os
-import time
-from datetime import datetime, timedelta
+import uuid
+from pathlib import Path
+from datetime import datetime, timezone
 
-# Set the reminder time
-reminder_time = "19:00"
+# Bot's data folder: this script lives in Luna projects/agents/ -> go up to Luna 4.0 then data/
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent.parent
+_REMINDERS_FILE = _PROJECT_ROOT / "data" / "reminders.json"
 
-# Get the current date
-current_date = datetime.now().date()
+REMINDER_TIME = "19:00"
+MESSAGE = "take your medicine"
 
-# Calculate the next reminder date
-next_reminder = current_date if current_date.strftime("%H:%M") <= reminder_time else current_date + timedelta(days=1)
 
-# Set the reminder time
-next_reminder_time = datetime.combine(next_reminder, datetime.strptime(reminder_time, "%H:%M").time())
+def main() -> None:
+    user_id = os.environ.get("LINKED_DISCORD_USER_ID", "").strip()
+    if not user_id:
+        print("Set LINKED_DISCORD_USER_ID in .env (your Discord user ID). Luna needs it to DM you.")
+        return
 
-# Get the path to the reminders file
-reminders_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'reminders.txt')
+    reminders = []
+    if _REMINDERS_FILE.is_file():
+        try:
+            with open(_REMINDERS_FILE, encoding="utf-8") as f:
+                reminders = json.load(f)
+            if not isinstance(reminders, list):
+                reminders = []
+        except Exception:
+            reminders = []
 
-# Append the reminder to the reminders file
-with open(reminders_file, 'a') as f:
-    f.write(f"Take medicine at {reminder_time} on {next_reminder.strftime('%Y-%m-%d')}\n")
+    # Avoid duplicate daily medicine reminder
+    for r in reminders:
+        if r.get("message") == MESSAGE and r.get("time") == REMINDER_TIME and r.get("recurring") == "daily":
+            print("Daily medicine reminder at 7pm is already registered. Luna will DM you.")
+            return
 
-# Print confirmation
-print("Reminder set for daily medicine at 7 p.m.")
+    entry = {
+        "id": str(uuid.uuid4())[:8],
+        "time": REMINDER_TIME,
+        "message": MESSAGE,
+        "discord_user_id": user_id,
+        "recurring": "daily",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    reminders.append(entry)
+    _REMINDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_REMINDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(reminders, f, indent=2, ensure_ascii=False)
+
+    print("Daily medicine reminder at 7pm registered. Luna will DM you with a voice note every day.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,12 +1,16 @@
 """
 Luna memory: 4-layer persistent memory per user/scope.
 Stored in a JSON file; injected into the system prompt so Luna "remembers".
+Learning from conversation is gated by Luna's brain (luna_brain) so she stores
+what matters (e.g. "remember X", facts, or when the neuron layer spikes).
 
 Layers:
   1. Core      — Essential facts (name, always-remember). Max 10, always in prompt first.
   2. Long-term — Stored facts over time. Many, up to 20 in prompt (excluding recent 5).
   3. Short-term — Last 5 memories added (recent). Subset of long-term by recency.
   4. Working   — Current conversation (message_history). Not stored; passed at call time.
+
+A 5th layer can be added later (e.g. episodic or session) if needed.
 """
 import json
 from datetime import datetime
